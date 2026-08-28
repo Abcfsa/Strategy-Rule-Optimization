@@ -1,0 +1,19 @@
+{#- 评测反馈构造（报告 §4.7.2，失败/成功 ~1:1 优先失败）-#}
+{#- 输入：failed, passed（已按预算截断）-#}
+
+(Shown {{ failed|length }} failed and {{ passed|length }} succeeded examples.)
+
+{% for r in failed %}
+[{{ loop.index }}] [WRONG]
+Problem: {{ r.problem }}
+Agent reasoning: {{ r.reasoning or "(none)" }}
+Agent answer: {{ r.prediction }}
+Ground truth: {{ r.answer }}
+{% endfor %}
+{% for r in passed %}
+[{{ failed|length + loop.index }}] [CORRECT]
+Problem: {{ r.problem }}
+Agent reasoning: {{ r.reasoning or "(none)" }}
+Agent answer: {{ r.prediction }}
+Ground truth: {{ r.answer }}
+{% endfor %}

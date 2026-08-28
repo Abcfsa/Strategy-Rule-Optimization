@@ -1,0 +1,33 @@
+{#- 对比规则归纳（报告 §4.7.2，ETGPO + AIR）-#}
+{#- 输入：error_category, correct_examples, wrong_examples -#}
+{#- 输出：结构化规则（trigger → action + evidence）-#}
+
+You are distilling reusable problem-solving rules from paired examples.
+
+# Error Category
+{{ category.name }}: {{ category.description }}
+
+# Correct Examples (same cluster, solved successfully)
+{% for ex in correct_examples %}
+--- Example {{ loop.index }}
+Problem: {{ ex.problem }}
+Key reasoning: {{ ex.reasoning_summary }}
+Answer: {{ ex.answer }}
+{% endfor %}
+
+# Wrong Examples (this error category)
+{% for ex in wrong_examples %}
+--- Example {{ loop.index }}
+Problem: {{ ex.problem }}
+Faulty reasoning: {{ ex.reasoning_summary }}
+Wrong answer: {{ ex.prediction }} (correct: {{ ex.answer }})
+{% endfor %}
+
+# Task
+Contrast the correct and wrong examples. Produce a DETAILED rule with examples:
+- trigger: the condition under which this rule applies ("if/when ...")
+- action: what to do / what to avoid ("then ...")
+- polarity: positive (do this) | negative (avoid this)
+- evidence: one correct and one wrong example illustrating the rule
+
+Be detailed — short rules underperform (ETGPO ablation: -2.22).

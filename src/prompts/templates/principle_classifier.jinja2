@@ -1,0 +1,24 @@
+{#- 原则/补丁分类器（报告 §4.6 机制 1，TextReg 双证据提纯的分类器）-#}
+{#- 输入：candidate_edit, batch_evidence, recurrence_stats -#}
+{#- 输出：principle | patch + 理由 -#}
+
+You are a knowledge gatekeeper deciding whether a prompt edit is a broadly-applicable
+PRINCIPLE or a narrow edge-case PATCH.
+
+# Candidate Edit
+{{ candidate_edit }}
+
+# Local Evidence (this batch)
+Covers {{ n_failures_covered }} of {{ n_batch_failures }} failures in the current batch.
+
+# Global Evidence (rule bank recurrence)
+Similar failure patterns recurred in {{ recurrence }} previous batches across
+{{ n_clusters }} task cluster(s).
+
+# Decision
+Classify as:
+- "principle": the edit addresses a recurring, broadly-applicable reasoning strategy
+- "patch": the edit is specific to a narrow edge case or a single sample
+
+Output ONLY: principle | patch, followed by a one-line justification.
+When uncertain, default to "patch" (conservative: keep it in the rule layer).

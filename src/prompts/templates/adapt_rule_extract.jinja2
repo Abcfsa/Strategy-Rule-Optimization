@@ -1,0 +1,21 @@
+{#- DG 式规则提取（报告 §4.7.3，arXiv:2511.04847）-#}
+{#- 输入：interaction_tuples（问题, 推理, 答案, 判分）-#}
+{#- 输出：人类可读的候选规则列表 -#}
+
+You are extracting reusable rules from test-time interactions with a math environment.
+
+# Interactions (question, reasoning, answer, verdict)
+{% for t in tuples %}
+--- Interaction {{ loop.index }} [{{ t.verdict }}]
+Problem: {{ t.problem }}
+Reasoning: {{ t.reasoning_summary }}
+Answer: {{ t.answer }}
+{% endfor %}
+
+# Task
+Extract human-readable rules that explain the successes and failures:
+- From failures: what went wrong and what should be done instead
+- From successes: what strategy worked and when it applies
+
+Filter out trivial or redundant rules. Keep each rule specific enough to be
+actionable but general enough to apply to unseen problems of the same type.
