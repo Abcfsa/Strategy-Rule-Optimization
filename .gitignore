@@ -11,6 +11,7 @@ venv/
 # 环境与密钥
 .env
 .env.*
+!.env.example
 
 # 运行产物（训练/适应输出、日志）
 outputs/
