@@ -9,7 +9,15 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .llm import Embedder, Example, ReflectionLM, Strategy, TaskLM, Trace
+from .llm import (
+    Embedder,
+    Example,
+    ReflectionLM,
+    Strategy,
+    TaskLM,
+    Trace,
+    TrainSample,
+)
 from .knowledge import KnowledgeBase
 
 
@@ -32,21 +40,33 @@ class SROEngine:
         self.match_threshold = match_threshold
         self.top_k = top_k
 
+    def set_dataset(self, dataset: str) -> None:
+        """绑定数据集：把对应 evaluate_answer 注入 TaskLM.judger。
+
+        dataset: gsm8k / math / aime / hotpotqa。判分逻辑复用
+        openai_api_test 中已验证的函数，保证与基线一致。
+        """
+        from .datasets import _import_eval
+        judger, _ = _import_eval(dataset)
+        self.task_lm.judger = judger
+
     # ===================================================================
     # 阶段一：训练与反思迭代
     # ===================================================================
 
     def train_and_reflect(
         self,
-        train_set: list[str],
+        train_set: list[TrainSample],
         n_iters: int = 3,
         candidates_per_iter: int = 2,
         verbose: bool = True,
     ) -> None:
         """训练闭环。
 
+        train_set 元素为 TrainSample（含 problem + 标准答案），反思据此区分对/错轨迹。
+
         每轮：
-          1. TaskLM 跑训练集 → 轨迹+结果
+          1. TaskLM 跑训练集 → 轨迹+结果（用标准答案判对错）
           2. ReflectionLM 反思 → 短期规律 + 长期策略
           3. 写入知识库
           4. 用长期策略迭代 TaskLM 的 prompt：生成候选策略→
@@ -55,15 +75,21 @@ class SROEngine:
         """
         for it in range(1, n_iters + 1):
             if verbose:
-                print(f"\n=== 训练迭代 {it}/{n_iters} ===")
+                print(f"\n=== Train iteration {it}/{n_iters} ===")
 
             # 1) TaskLM 运行训练集（带当前策略 + 当前已有短期规律）
             traces: list[Trace] = []
-            for problem in train_set:
+            for sample in train_set:
                 # 训练期也可检索已积累的短期规律作为上下文
-                ctx_examples = self.kb.retrieve(problem, k=self.top_k,
-                                                threshold=self.match_threshold)
-                trace = self.task_lm.run(problem, context_examples=ctx_examples)
+                ctx_examples = self.kb.retrieve(
+                    sample.problem, k=self.top_k, threshold=self.match_threshold
+                )
+                trace = self.task_lm.run(
+                    sample.problem,
+                    context_examples=ctx_examples,
+                    gold_answer=sample.answer,
+                    answer_type=sample.answer_type,
+                )
                 traces.append(trace)
 
             # 2) 反思
@@ -82,16 +108,16 @@ class SROEngine:
 
             if verbose:
                 acc = sum(t.result.correct for t in traces) / len(traces)
-                print(f"  本轮准确率: {acc:.2%}")
-                print(f"  短期规律新增: {len(short_patterns)} 条"
-                      f"（累计 {len(self.kb.examples)}）")
-                print(f"  长期策略版本: v{best_strategy.version}")
+                print(f"  Accuracy this round: {acc:.2%}")
+                print(f"  New patterns: {len(short_patterns)}"
+                      f" (total {len(self.kb.examples)})")
+                print(f"  Strategy version: v{best_strategy.version}")
 
     def _evolve_strategy(
         self,
         reflected_strategy: Strategy,
         traces: list[Trace],
-        train_set: list[str],
+        train_set: list[TrainSample],
         n_candidates: int,
     ) -> Strategy:
         """策略迭代核心：候选生成 → 在训练子集上打分 → 保留最优。
@@ -100,7 +126,7 @@ class SROEngine:
         """
         # 候选 = 反思产出的策略 + TaskLM 基于反馈的若干变体
         candidates: list[Strategy] = [reflected_strategy]
-        feedback = f"本轮准确率 {sum(t.result.correct for t in traces)}/{len(traces)}"
+        feedback = f"Accuracy this round: {sum(t.result.correct for t in traces)}/{len(traces)}"
         candidates += self.task_lm.mutate(feedback, candidates=n_candidates)
 
         # 在训练子集上打分每个候选（临时换上候选策略跑一个子集）
@@ -109,7 +135,14 @@ class SROEngine:
         eval_subset = train_set[: max(1, len(train_set) // 3)]
         for cand in candidates:
             self.task_lm.update_strategy(cand)
-            cand_traces = [self.task_lm.run(p) for p in eval_subset]
+            cand_traces = [
+                self.task_lm.run(
+                    s.problem,
+                    gold_answer=s.answer,
+                    answer_type=s.answer_type,
+                )
+                for s in eval_subset
+            ]
             cand_score = sum(self.task_lm.score(t) for t in cand_traces) / len(cand_traces)
             cand.score = cand_score
             if cand_score > best_score:
@@ -142,7 +175,7 @@ class SROEngine:
             answer = trace.result.answer
             meta["dynamic_added"] = False
             if verbose:
-                print(f"[命中] 命中 {len(hits)} 条规律 → 直接回答")
+                print(f"[MATCH] hit {len(hits)} patterns -> answering directly")
         else:
             # ===== 不匹配分支：动态学习机制（架构图标注"待考虑"）=====
             answer, trace = self._dynamic_learning(question, meta, verbose)
@@ -167,7 +200,7 @@ class SROEngine:
 
         # 3) 第二轮测试：用长期策略 + 这条临时规律重新检索并回答
         if verbose:
-            print("[未命中] 触发动态学习：临时归纳规律 → 第二轮测试")
+            print("[MISS] dynamic learning triggered: induce temporary pattern -> second-round attempt")
         hits = self.kb.retrieve(question, k=self.top_k,
                                threshold=0.0)  # 临时放宽，确保取到刚加的
         trace = self.task_lm.run(question, context_examples=hits)

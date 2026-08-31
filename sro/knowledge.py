@@ -96,11 +96,11 @@ class KnowledgeBase:
 
     def save(self, path: str) -> None:
         """保存到磁盘。占位：真实实现用 JSON / pickle 序列化 examples 与 strategy。"""
-        raise NotImplementedError("持久化在后续阶段接入")
+        raise NotImplementedError("Persistence will be added in a later stage")
 
     @classmethod
     def load(cls, path: str) -> "KnowledgeBase":
-        raise NotImplementedError("持久化在后续阶段接入")
+        raise NotImplementedError("Persistence will be added in a later stage")
 
     # ---------------- 工具 ----------------
 

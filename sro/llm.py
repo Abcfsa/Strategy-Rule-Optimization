@@ -75,6 +75,21 @@ class Strategy:
     parent_version: int = 0              # 由哪个版本演化而来
 
 
+@dataclass
+class TrainSample:
+    """训练样本：题目 + 标准答案。
+
+    answer_type:
+        exact    —— 字符串归一化后精确匹配（默认）
+        numeric  —— 数值比对（容差 1e-6），支持整数/小数/分数 a/b
+        freeform —— 自由文本，占位返回 False（后续接 LLM judge）
+    """
+
+    problem: str
+    answer: str
+    answer_type: str = "exact"
+
+
 # ---------------------------------------------------------------------------
 # OpenAI 兼容客户端（懒加载，无 openai 库或无 key 时回退占位）
 # ---------------------------------------------------------------------------
@@ -108,7 +123,7 @@ class _OpenAIClient:
     def chat(self, model: str, system: str, user: str, timeout: Optional[float] = None) -> str:
         """返回模型文本输出。is_real=False 时回退占位。"""
         if not self.is_real:
-            return f"[TaskLM 占位回复] system={system[:40]!r} user={user[:40]!r}"
+            return f"[TaskLM placeholder reply] system={system[:40]!r} user={user[:40]!r}"
         resp = self._client.chat.completions.create(
             model=model,
             messages=[{"role": "system", "content": system},
@@ -183,25 +198,37 @@ class TaskLM:
         self.model = cfg.task_model
         self.timeout = cfg.task_timeout
         self.embedder = embedder or Embedder()
+        # 判分回调：由 engine 注入对应数据集的 evaluate_answer。
+        # 为 None 时回退到内置 is_correct（numeric/exact/freeform 简单判分）。
+        self.judger: Optional[callable] = None
 
     def _call_llm(self, system: str, user: str) -> str:
         """真实模型调用。无 key 时由 _OpenAIClient 自动回退占位。"""
         return _get_client().chat(self.model, system, user, timeout=self.timeout)
 
     # ---- 核心运行 ----
-    def run(self, problem: str, context_examples: Optional[list[Example]] = None) -> Trace:
+    def run(
+        self,
+        problem: str,
+        context_examples: Optional[list[Example]] = None,
+        gold_answer: Optional[str] = None,
+        answer_type: str = "exact",
+    ) -> Trace:
         """在策略 + 检索到的短期规律下执行题目。
 
         context_examples: 命中的短期规律（few-shot 上下文）。
+        gold_answer:      标准答案；提供则据 answer_type 判对错。
+        answer_type:      exact / numeric / freeform。
         """
         few_shot = "\n".join(e.to_prompt_str() for e in (context_examples or []))
         system_prompt = self._assemble_system_prompt(few_shot)
         # 记录附加上下文，供反思分析
         ctx = {"strategy_version": self.strategy.version,
                "n_examples": len(context_examples or []),
-               "examples_text": few_shot}
+               "examples_text": few_shot,
+               "answer_type": answer_type}
         raw = self._call_llm(system_prompt, problem)
-        answer, correct = self._parse_output(raw, problem)
+        answer, correct = self._parse_output(raw, gold_answer, answer_type)
         return Trace(problem=problem, trajectory=raw,
                      result=Result(answer=answer, correct=correct), context=ctx)
 
@@ -211,12 +238,89 @@ class TaskLM:
             parts.append("Relevant past experiences:\n" + few_shot)
         return "\n\n".join(parts)
 
-    def _parse_output(self, raw: str, problem: str) -> tuple[str, bool]:
-        """从原始输出抽取答案 + 判定对错。占位：返回原文并默认错。
+    # ---- 答案抽取 + 判分 ----
+    @staticmethod
+    def extract_answer(raw: str) -> str:
+        """从 LLM 原始输出抽取最终答案。
 
-        真实场景：解析 \\boxed{} / 数字；对照 ground truth 判对错。
+        优先级：\\boxed{...} > "Final answer:"/"最终答案:" 后内容 >
+        末尾数字。找不到则返回去掉首尾空白的原文。
         """
-        return raw, False
+        import re
+        # 1) \boxed{...}（含嵌套花括号的贪婪匹配）
+        m = re.search(r"\\boxed\{(.+?)\}", raw)
+        if m:
+            return m.group(1).strip()
+        # 2) "Final answer:" / "最终答案:" / "答案是:" 等
+        m = re.search(
+            r"(?:final answer|最终答案|答案(?:是为|是|:)|answer is|the answer is)\s*[:：]?\s*(.+)$",
+            raw, re.IGNORECASE,
+        )
+        if m:
+            return m.group(1).strip().splitlines()[-1].strip()
+        # 3) 末尾独立数字
+        m = re.search(r"(-?\d+(?:\.\d+)?)\s*$", raw.strip())
+        if m:
+            return m.group(1)
+        return raw.strip()
+
+    @staticmethod
+    def normalize_answer(ans: str, answer_type: str) -> str | float | None:
+        """归一化答案。numeric 返回 float，exact 返回 str，失败 None。"""
+        import re
+        s = (ans or "").strip()
+        # 先剥 \boxed{...} 取其内容（再处理残留的裸 \ 与 {}）
+        m = re.search(r"\\boxed\{(.+?)\}", s)
+        if m:
+            s = m.group(1)
+        s = re.sub(r"[\\{}]", "", s)      # 去残留反斜杠 / 花括号
+        s = s.replace(" ", "")
+        if answer_type == "numeric":
+            try:
+                if "/" in s:             # 分数 a/b
+                    a, b = s.split("/")
+                    return float(a) / float(b)
+                return float(s)
+            except (ValueError, ZeroDivisionError):
+                return None
+        return s.lower()                  # exact：小写化字符串
+
+    @classmethod
+    def is_correct(cls, predicted: str, gold: str, answer_type: str) -> bool:
+        """内置简单判分（无 judger 时回退用）。
+
+        predicted 可以是 \boxed{...} 形式（normalize 会剥离）。
+        numeric 用「绝对 1e-6 或相对 1e-4」双容差，覆盖 2/3 vs 0.6667
+        这类四舍五入。
+        """
+        if answer_type == "freeform":
+            return False                 # freeform 必须靠 judger（SQuAD 等）
+        p = cls.normalize_answer(predicted, answer_type)
+        g = cls.normalize_answer(gold, answer_type)
+        if p is None or g is None:
+            return False
+        if answer_type == "numeric":
+            if p == g:
+                return True
+            denom = max(abs(g), 1e-12)
+            return abs(p - g) < 1e-6 or abs(p - g) / denom < 1e-4
+        return p == g                    # exact 字符串比对
+
+    def _parse_output(self, raw: str, gold_answer: Optional[str],
+                      answer_type: str) -> tuple[str, bool]:
+        """抽取答案并据 gold_answer 判对错。无 gold_answer 时默认错。
+
+        优先用注入的 judger（数据集专用判分）；否则回退内置 is_correct。
+        """
+        answer = self.extract_answer(raw)
+        if gold_answer is None:
+            return answer, False
+        if self.judger is not None:
+            try:
+                return answer, bool(self.judger(answer, gold_answer))
+            except Exception:
+                return answer, False
+        return answer, self.is_correct(answer, gold_answer, answer_type)
 
     # ---- 打分（候选筛选用）----
     def score(self, trace: Trace) -> float:
@@ -239,10 +343,11 @@ class TaskLM:
         out: list[Strategy] = []
         if c.is_real:
             for i in range(candidates):
-                sys = ("你是 prompt 优化器。基于以下反馈改写当前策略，"
-                       "保持简洁、可复用，输出改写后的策略正文。")
-                usr = (f"当前策略:\n{self.strategy.text}\n\n"
-                       f"反馈:\n{feedback}\n\n请输出第 {i+1} 个改写变体。")
+                sys = ("You are a prompt optimizer. Rewrite the current strategy "
+                       "based on the following feedback. Keep it concise and "
+                       "reusable. Output only the rewritten strategy text.")
+                usr = (f"Current strategy:\n{self.strategy.text}\n\n"
+                       f"Feedback:\n{feedback}\n\nOutput rewrite variant #{i+1}.")
                 new_text = c.chat(self.model, sys, usr, timeout=self.timeout)
                 out.append(Strategy(
                     text=new_text, version=self.strategy.version + 1,
@@ -297,42 +402,42 @@ class ReflectionLM:
         if c.is_real:
             # 短期规律：让 LLM 从错题/对题中提炼要点
             for t in wrong[:3]:
-                sys = "你是经验提炼助手。从一条错误轨迹中提炼一条可复用的避坑要点（一句话）。"
-                usr = f"题目:{t.problem}\n错误答案:{t.result.answer}\n轨迹摘录:{t.trajectory[:200]}"
+                sys = "You are an experience distillation assistant. Extract one reusable pitfall-avoidance lesson from this failed trajectory (one sentence)."
+                usr = f"Problem:\n{t.problem}\nWrong answer:\n{t.result.answer}\nTrajectory excerpt:\n{t.trajectory[:200]}"
                 text = c.chat(self.model, sys, usr, timeout=self.timeout)
                 p = Example(text=text, source_run_id=t.run_id, polarity=-1)
                 p.embedding = self.embedder.embed(text)
                 patterns.append(p)
             for t in correct[:3]:
-                sys = "你是经验提炼助手。从一条正确轨迹中提炼一条可复用的有效做法（一句话）。"
-                usr = f"题目:{t.problem}\n轨迹摘录:{t.trajectory[:200]}"
+                sys = "You are an experience distillation assistant. Extract one reusable effective practice from this correct trajectory (one sentence)."
+                usr = f"Problem:\n{t.problem}\nTrajectory excerpt:\n{t.trajectory[:200]}"
                 text = c.chat(self.model, sys, usr, timeout=self.timeout)
                 p = Example(text=text, source_run_id=t.run_id, polarity=+1)
                 p.embedding = self.embedder.embed(text)
                 patterns.append(p)
             # 长期策略
-            sys = "你是元学习方法论专家，归纳出一份通用的解题策略。"
-            usr = f"总结这 {len(traces)} 条轨迹的共性经验。"
+            sys = "You are a meta-learning methodology expert. Summarize a general problem-solving strategy."
+            usr = f"Summarize the common lessons from these {len(traces)} trajectories."
             long_text = c.chat(self.model, sys, usr, timeout=self.timeout)
         else:
             # 占位逻辑（无 key）
             for t in wrong[:3]:
                 p = Example(
-                    text=f"在处理「{t.problem[:20]}」类问题时常犯错误：{t.result.answer[:30]}",
+                    text=f"Common mistake on problems like '{t.problem[:20]}': {t.result.answer[:30]}",
                     source_run_id=t.run_id, polarity=-1,
                 )
                 p.embedding = self.embedder.embed(p.text)
                 patterns.append(p)
             for t in correct[:3]:
                 p = Example(
-                    text=f"有效做法：{t.trajectory[:60]}",
+                    text=f"Effective practice: {t.trajectory[:60]}",
                     source_run_id=t.run_id, polarity=+1,
                 )
                 p.embedding = self.embedder.embed(p.text)
                 patterns.append(p)
             long_text = self._call_llm(
-                system="你是元学习方法论专家，归纳出一份通用的解题策略。",
-                user=f"总结这 {len(traces)} 条轨迹的共性经验。",
+                system="You are a meta-learning methodology expert. Summarize a general problem-solving strategy.",
+                user=f"Summarize the common lessons from these {len(traces)} trajectories.",
             )
 
         long_strategy = Strategy(text=long_text, version=1)
@@ -342,7 +447,7 @@ class ReflectionLM:
     def extract_pattern_from_question(self, question: str) -> Example:
         """对未命中的测试问题临时归纳一条短期规律（动态学习机制）。"""
         text = self._call_llm(
-            system="从单个问题中提炼一条可复用的解题要点。",
+            system="Distill one reusable problem-solving takeaway from this single problem.",
             user=question,
         )
         ex = Example(text=text, polarity=+1, permanent=False)

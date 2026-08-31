@@ -9,10 +9,20 @@
     未命中：动态学习（ReflectionLM 临时归纳规律、临时入库）→ 第二轮测试。
 """
 
-from .llm import TaskLM, ReflectionLM, Embedder, Trace, Result, Example, Strategy
+from .llm import (
+    TaskLM,
+    ReflectionLM,
+    Embedder,
+    Trace,
+    Result,
+    Example,
+    Strategy,
+    TrainSample,
+)
 from .knowledge import KnowledgeBase
 from .engine import SROEngine
 from .config import Config, get_config
+from . import datasets  # noqa: F401  数据集加载（按需 import 数据库）
 
 __all__ = [
     "TaskLM",
@@ -22,6 +32,7 @@ __all__ = [
     "Result",
     "Example",
     "Strategy",
+    "TrainSample",
     "KnowledgeBase",
     "SROEngine",
     "Config",

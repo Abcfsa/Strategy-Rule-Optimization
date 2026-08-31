@@ -28,6 +28,10 @@ DEFAULTS = {
     "EMBED_DIM": "1536",
     "MATCH_THRESHOLD": "0.6",
     "TOP_K": "3",
+    "GSM8K_PATH": "",
+    "MATH_PATH": "",
+    "HOTPOTQA_PATH": "",
+    "AIME_PATH": "",
 }
 
 
@@ -43,6 +47,10 @@ class Config:
     embed_dim: int
     match_threshold: float
     top_k: int
+    gsm8k_path: str = ""
+    math_path: str = ""
+    hotpotqa_path: str = ""
+    aime_path: str = ""
 
     @property
     def has_api_key(self) -> bool:
@@ -64,6 +72,10 @@ class Config:
             embed_dim=int(g("EMBED_DIM")),
             match_threshold=float(g("MATCH_THRESHOLD")),
             top_k=int(g("TOP_K")),
+            gsm8k_path=g("GSM8K_PATH"),
+            math_path=g("MATH_PATH"),
+            hotpotqa_path=g("HOTPOTQA_PATH"),
+            aime_path=g("AIME_PATH"),
         )
 
 
