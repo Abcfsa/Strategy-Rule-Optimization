@@ -2,3 +2,6 @@
 openai>=1.0.0
 httpx>=0.27.0
 python-dotenv>=1.0.0
+
+# Embedding（本地语义检索；不装则回退哈希伪向量，仅作演示）
+sentence-transformers>=2.2.0

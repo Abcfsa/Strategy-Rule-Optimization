@@ -160,22 +160,38 @@ def _hash_embed(text: str, dim: int = 64) -> list[float]:
 
 
 # ---------------------------------------------------------------------------
-# Embedder —— 向量化
+# Embedder —— 向量化（本地 sentence-transformers，不依赖中转端点）
 # ---------------------------------------------------------------------------
 
 
 class Embedder:
-    """文本向量化。有 key 走 OpenAI embeddings，无 key 用哈希伪向量。"""
+    """文本向量化。
+
+    默认用本地 sentence-transformers（all-MiniLM-L6-v2，dim=384），
+    离线、免费、语义检索够用。首次运行下载 ~80MB 模型到 HF 缓存。
+    未装 sentence-transformers 时回退哈希伪向量（仅作演示，无语义）。
+    """
 
     def __init__(self, model: Optional[str] = None, dim: Optional[int] = None) -> None:
         cfg = get_config()
         self.model = model or cfg.embed_model
         self.dim = dim or cfg.embed_dim
+        self._st_model = None
+        try:
+            from sentence_transformers import SentenceTransformer
+            self._st_model = SentenceTransformer(self.model)
+            # 取真实维度（新版本改名 get_embedding_dimension，做兼容）
+            get_dim = getattr(self._st_model, "get_embedding_dimension",
+                              getattr(self._st_model, "get_sentence_embedding_dimension", None))
+            if get_dim is not None:
+                self.dim = get_dim()
+        except Exception:
+            self._st_model = None  # 回退哈希伪向量
 
     def embed(self, text: str) -> list[float]:
-        c = _get_client()
-        if c.is_real:
-            return c.embed(self.model, text)
+        """返回文本向量。有本地模型用真实 embedding，否则哈希伪向量。"""
+        if self._st_model is not None:
+            return self._st_model.encode(text).tolist()
         return _hash_embed(text, dim=64)
 
 
