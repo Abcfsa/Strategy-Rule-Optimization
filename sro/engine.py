@@ -182,6 +182,7 @@ class SROEngine:
 
         # 清理本轮临时规律，避免污染下一题
         self.kb.drop_tentative()
+        meta["raw"] = trace.trajectory
         return answer, meta
 
     def _dynamic_learning(

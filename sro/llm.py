@@ -120,16 +120,127 @@ class _OpenAIClient:
             self._client = None
             self.is_real = False
 
-    def chat(self, model: str, system: str, user: str, timeout: Optional[float] = None) -> str:
-        """返回模型文本输出。is_real=False 时回退占位。"""
+    # ---- API kwargs 构建（移植自 gepa_aime_v2.build_api_kwargs）----
+    @staticmethod
+    def _sdk_major() -> int:
+        try:
+            import openai
+            return int(getattr(openai, "__version__", "0").split(".")[0])
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _inject(kwargs: dict, key: str, value) -> None:
+        """非标准参数注入 extra_body（SDK v1+）或 kwargs（v0）。"""
+        if _OpenAIClient._sdk_major() >= 1:
+            kwargs.setdefault("extra_body", {})[key] = value
+        else:
+            kwargs[key] = value
+
+    def build_api_kwargs(
+        self, model: str, *, temperature: float, max_tokens: int,
+        enable_thinking: bool, max_context_len: int, extra_params: str,
+    ) -> dict:
+        """构建 chat.completions.create 的 kwargs（含 thinking / context 注入）。
+
+        逻辑同 gepa_aime_v2.build_api_kwargs：
+          - extra_params(JSON) 白名单字段直填，其余进 extra_body
+          - thinking 注入按模型族：qwen/qwq→enable_thinking；glm→reasoning；
+            其他→reasoning_effort；未被 extra_params 显式覆盖时才注入
+          - max_context_len>0 → extra_body.max_model_len
+        """
+        import json as _json
+        kwargs: dict = {"model": model, "temperature": temperature,
+                        "max_tokens": max_tokens}
+        # extra_params 解析（全局共享）
+        if extra_params and extra_params.strip():
+            try:
+                override = _json.loads(extra_params)
+                for k, v in override.items():
+                    if k in ("model", "temperature", "max_tokens", "tools",
+                             "tool_choice", "reasoning_effort", "stream"):
+                        kwargs[k] = v
+                    else:
+                        self._inject(kwargs, k, v)
+            except _json.JSONDecodeError as e:
+                print(f"  [WARNING] Invalid EXTRA_PARAMS JSON: {e}")
+        # thinking 注入（若 extra_params 未显式覆盖）
+        _has = ("reasoning_effort" in kwargs
+                or "enable_thinking" in kwargs
+                or "enable_thinking" in kwargs.get("extra_body", {})
+                or "reasoning" in kwargs.get("extra_body", {}))
+        ml = (model or "").lower()
+        if not _has:
+            if enable_thinking:
+                if "qwen" in ml or "qwq" in ml:
+                    self._inject(kwargs, "enable_thinking", True)
+                elif "glm" in ml:
+                    self._inject(kwargs, "reasoning", True)
+                else:
+                    kwargs["reasoning_effort"] = "medium"
+            else:
+                # qwen3（非 qwen3.）默认开思考，非流式必须关；glm 同理关 reasoning
+                if "qwen3" in ml and "qwen3." not in ml:
+                    self._inject(kwargs, "enable_thinking", False)
+                elif "glm" in ml:
+                    self._inject(kwargs, "reasoning", False)
+        # 上下文长度
+        if max_context_len > 0 and "max_model_len" not in kwargs.get("extra_body", {}):
+            self._inject(kwargs, "max_model_len", max_context_len)
+        return kwargs
+
+    @staticmethod
+    def _needs_stream(kwargs: dict) -> bool:
+        """开了 thinking 的模型族必须走流式（端点硬性要求）。"""
+        eb = kwargs.get("extra_body", {})
+        return eb.get("enable_thinking") is True or eb.get("reasoning") is True
+
+    @staticmethod
+    def _aggregate_stream(stream) -> str:
+        """聚合流式 delta：取 content，为空则回退 reasoning_content。"""
+        parts: list[str] = []
+        reasoning_parts: list[str] = []
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if getattr(delta, "content", None):
+                parts.append(delta.content)
+            rc = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+            if rc:
+                reasoning_parts.append(rc)
+        content = "".join(parts)
+        if content.strip():
+            return content
+        # 模型全输出到 reasoning 时回退，保证有东西可抽答案
+        return "".join(reasoning_parts)
+
+    def chat(self, model: str, system: str, user: str, *,
+             timeout: Optional[float] = None,
+             temperature: float = 0.0, max_tokens: int = 4096,
+             enable_thinking: bool = False, max_context_len: int = 0,
+             extra_params: str = "") -> str:
+        """返回模型文本输出。is_real=False 时回退占位。
+
+        开启 thinking 的模型族走流式（端点硬性要求），聚合 delta.content；
+        否则非流式（现状路径不变）。
+        """
         if not self.is_real:
             return f"[TaskLM placeholder reply] system={system[:40]!r} user={user[:40]!r}"
-        resp = self._client.chat.completions.create(
-            model=model,
-            messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": user}],
-            timeout=timeout,
+        kwargs = self.build_api_kwargs(
+            model, temperature=temperature, max_tokens=max_tokens,
+            enable_thinking=enable_thinking, max_context_len=max_context_len,
+            extra_params=extra_params,
         )
+        messages = [{"role": "system", "content": system},
+                    {"role": "user", "content": user}]
+        if self._needs_stream(kwargs):
+            kwargs["stream"] = True
+            stream = self._client.chat.completions.create(
+                messages=messages, timeout=timeout, **kwargs)
+            return self._aggregate_stream(stream)
+        resp = self._client.chat.completions.create(
+            messages=messages, timeout=timeout, **kwargs)
         return resp.choices[0].message.content or ""
 
     def embed(self, model: str, text: str) -> list[float]:
@@ -213,6 +324,11 @@ class TaskLM:
         self.strategy: Strategy = Strategy(text="", version=0)
         self.model = cfg.task_model
         self.timeout = cfg.task_timeout
+        self.temperature = cfg.task_temperature
+        self.max_tokens = cfg.task_max_tokens
+        self.enable_thinking = cfg.task_enable_thinking
+        self.max_context_len = cfg.task_max_context_len
+        self.extra_params = cfg.extra_params
         self.embedder = embedder or Embedder()
         # 判分回调：由 engine 注入对应数据集的 evaluate_answer。
         # 为 None 时回退到内置 is_correct（numeric/exact/freeform 简单判分）。
@@ -220,7 +336,13 @@ class TaskLM:
 
     def _call_llm(self, system: str, user: str) -> str:
         """真实模型调用。无 key 时由 _OpenAIClient 自动回退占位。"""
-        return _get_client().chat(self.model, system, user, timeout=self.timeout)
+        return _get_client().chat(
+            self.model, system, user, timeout=self.timeout,
+            temperature=self.temperature, max_tokens=self.max_tokens,
+            enable_thinking=self.enable_thinking,
+            max_context_len=self.max_context_len,
+            extra_params=self.extra_params,
+        )
 
     # ---- 核心运行 ----
     def run(
@@ -259,25 +381,51 @@ class TaskLM:
     def extract_answer(raw: str) -> str:
         """从 LLM 原始输出抽取最终答案。
 
-        优先级：\\boxed{...} > "Final answer:"/"最终答案:" 后内容 >
-        末尾数字。找不到则返回去掉首尾空白的原文。
+        覆盖模型常见输出格式（按优先级）：
+          1. \\boxed{...}        —— LaTeX 标准答案包装
+          2. "The answer is X" / "最终答案: X" / "答案是X"
+          3. <answer>X</answer> 标签
+          4. $X$ / \\$X$ / **X** 行内包装里的数字
+          5. 文本中最后一个数字（兜底）
+        找不到则返回去掉首尾空白的原文。
         """
         import re
-        # 1) \boxed{...}（含嵌套花括号的贪婪匹配）
-        m = re.search(r"\\boxed\{(.+?)\}", raw)
-        if m:
-            return m.group(1).strip()
-        # 2) "Final answer:" / "最终答案:" / "答案是:" 等
+        # 1) \boxed{...}（用最后一个 \boxed，通常是最终答案）
+        last = raw.rfind("\\boxed")
+        if last != -1:
+            start = raw.find("{", last)
+            if start != -1:
+                depth = 0
+                for i in range(start, len(raw)):
+                    if raw[i] == "{":
+                        depth += 1
+                    elif raw[i] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            return raw[start + 1:i].strip()
+                return raw[start + 1:].strip()
+        # 2) "The answer is X" / "最终答案: X" / "答案是X"
         m = re.search(
-            r"(?:final answer|最终答案|答案(?:是为|是|:)|answer is|the answer is)\s*[:：]?\s*(.+)$",
+            r"(?:final answer|the answer is|answer is|最终答案|答案(?:是为|是|:))\s*[:：]?\s*(.+?)(?:[.。]?\s*$|\n)",
             raw, re.IGNORECASE,
         )
         if m:
-            return m.group(1).strip().splitlines()[-1].strip()
-        # 3) 末尾独立数字
-        m = re.search(r"(-?\d+(?:\.\d+)?)\s*$", raw.strip())
+            cand = m.group(1).strip()
+            # 若候选是 "X words" 这类，提取首个数字
+            return cand
+        # 3) <answer>X</answer> 标签
+        m = re.search(r"<answer>\s*(.+?)\s*</answer>", raw, re.IGNORECASE)
         if m:
-            return m.group(1)
+            return m.group(1).strip()
+        # 4) $X$ / \$X$ / **X** 行内包装
+        m = re.search(r"\$\\?([-\d,.]+)\$|\*\*([-\d,.]+)\*\*", raw)
+        if m:
+            return next(g for g in m.groups() if g)
+        # 5) 文本中最后一个数字（含逗号千分位/小数/分数）
+        #    先匹配带逗号的千分位（整体），再匹配套路纯数字
+        nums = re.findall(r"-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|-?\d+(?:\.\d+)?(?:/\d+)?", raw)
+        if nums:
+            return nums[-1].replace(" ", "")
         return raw.strip()
 
     @staticmethod
@@ -364,7 +512,7 @@ class TaskLM:
                        "reusable. Output only the rewritten strategy text.")
                 usr = (f"Current strategy:\n{self.strategy.text}\n\n"
                        f"Feedback:\n{feedback}\n\nOutput rewrite variant #{i+1}.")
-                new_text = c.chat(self.model, sys, usr, timeout=self.timeout)
+                new_text = self._call_llm(sys, usr)
                 out.append(Strategy(
                     text=new_text, version=self.strategy.version + 1,
                     parent_version=self.strategy.version,
@@ -396,11 +544,22 @@ class ReflectionLM:
         cfg = get_config()
         self.model = cfg.reflection_model
         self.timeout = cfg.reflection_timeout
+        self.temperature = cfg.reflection_temperature
+        self.max_tokens = cfg.reflection_max_tokens
+        self.enable_thinking = cfg.reflection_enable_thinking
+        self.max_context_len = cfg.reflection_max_context_len
+        self.extra_params = cfg.extra_params
         self.embedder = embedder or Embedder()
 
     def _call_llm(self, system: str, user: str) -> str:
         """真实模型调用。无 key 时回退占位。"""
-        return _get_client().chat(self.model, system, user, timeout=self.timeout)
+        return _get_client().chat(
+            self.model, system, user, timeout=self.timeout,
+            temperature=self.temperature, max_tokens=self.max_tokens,
+            enable_thinking=self.enable_thinking,
+            max_context_len=self.max_context_len,
+            extra_params=self.extra_params,
+        )
 
     # ---- 阶段一：批量反思 ----
     def reflect(self, traces: list[Trace]) -> tuple[list[Example], Strategy]:
@@ -420,21 +579,21 @@ class ReflectionLM:
             for t in wrong[:3]:
                 sys = "You are an experience distillation assistant. Extract one reusable pitfall-avoidance lesson from this failed trajectory (one sentence)."
                 usr = f"Problem:\n{t.problem}\nWrong answer:\n{t.result.answer}\nTrajectory excerpt:\n{t.trajectory[:200]}"
-                text = c.chat(self.model, sys, usr, timeout=self.timeout)
+                text = self._call_llm(sys, usr)
                 p = Example(text=text, source_run_id=t.run_id, polarity=-1)
                 p.embedding = self.embedder.embed(text)
                 patterns.append(p)
             for t in correct[:3]:
                 sys = "You are an experience distillation assistant. Extract one reusable effective practice from this correct trajectory (one sentence)."
                 usr = f"Problem:\n{t.problem}\nTrajectory excerpt:\n{t.trajectory[:200]}"
-                text = c.chat(self.model, sys, usr, timeout=self.timeout)
+                text = self._call_llm(sys, usr)
                 p = Example(text=text, source_run_id=t.run_id, polarity=+1)
                 p.embedding = self.embedder.embed(text)
                 patterns.append(p)
             # 长期策略
             sys = "You are a meta-learning methodology expert. Summarize a general problem-solving strategy."
             usr = f"Summarize the common lessons from these {len(traces)} trajectories."
-            long_text = c.chat(self.model, sys, usr, timeout=self.timeout)
+            long_text = self._call_llm(sys, usr)
         else:
             # 占位逻辑（无 key）
             for t in wrong[:3]:

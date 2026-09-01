@@ -24,6 +24,17 @@ DEFAULTS = {
     "REFLECTION_MODEL": "gpt-4o-mini",
     "TASK_TIMEOUT": "200",
     "REFLECTION_TIMEOUT": "60",
+    # ---- API 调用参数（task / reflection 各一套，移植自 gepa_aime_v2.py）----
+    "TASK_TEMPERATURE": "0.0",
+    "REFLECTION_TEMPERATURE": "0.7",
+    "TASK_MAX_TOKENS": "4096",
+    "REFLECTION_MAX_TOKENS": "2048",
+    "TASK_ENABLE_THINKING": "false",
+    "REFLECTION_ENABLE_THINKING": "false",
+    "TASK_MAX_CONTEXT_LEN": "0",
+    "REFLECTION_MAX_CONTEXT_LEN": "0",
+    "EXTRA_PARAMS": "",
+    # ---- 检索 / 匹配 ----
     "EMBED_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
     "EMBED_DIM": "384",
     "MATCH_THRESHOLD": "0.6",
@@ -35,6 +46,11 @@ DEFAULTS = {
 }
 
 
+def _parse_bool(s: str) -> bool:
+    """宽松布尔解析：1/true/yes/on → True，其余 False。"""
+    return str(s).strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass
 class Config:
     openai_base_url: str
@@ -43,6 +59,16 @@ class Config:
     reflection_model: str
     task_timeout: float
     reflection_timeout: float
+    # API 调用参数（task / reflection 各一套）
+    task_temperature: float
+    reflection_temperature: float
+    task_max_tokens: int
+    reflection_max_tokens: int
+    task_enable_thinking: bool
+    reflection_enable_thinking: bool
+    task_max_context_len: int
+    reflection_max_context_len: int
+    extra_params: str
     embed_model: str
     embed_dim: int
     match_threshold: float
@@ -68,6 +94,15 @@ class Config:
             reflection_model=g("REFLECTION_MODEL"),
             task_timeout=float(g("TASK_TIMEOUT")),
             reflection_timeout=float(g("REFLECTION_TIMEOUT")),
+            task_temperature=float(g("TASK_TEMPERATURE")),
+            reflection_temperature=float(g("REFLECTION_TEMPERATURE")),
+            task_max_tokens=int(g("TASK_MAX_TOKENS")),
+            reflection_max_tokens=int(g("REFLECTION_MAX_TOKENS")),
+            task_enable_thinking=_parse_bool(g("TASK_ENABLE_THINKING")),
+            reflection_enable_thinking=_parse_bool(g("REFLECTION_ENABLE_THINKING")),
+            task_max_context_len=int(g("TASK_MAX_CONTEXT_LEN")),
+            reflection_max_context_len=int(g("REFLECTION_MAX_CONTEXT_LEN")),
+            extra_params=g("EXTRA_PARAMS"),
             embed_model=g("EMBED_MODEL"),
             embed_dim=int(g("EMBED_DIM")),
             match_threshold=float(g("MATCH_THRESHOLD")),
