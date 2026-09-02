@@ -98,30 +98,31 @@ class SROEngine:
         candidates_per_iter: int = 2,
         verbose: bool = True,
     ) -> list[dict]:
-        """训练闭环。返回每轮的历史记录（供输出保存用）。
+        """训练闭环。按 evo_mode 分流。返回每轮历史记录。"""
+        if self.evo_mode == "gepa":
+            return self._train_gepa(train_set, verbose)
+        return self._train_classic(train_set, n_iters, candidates_per_iter, verbose)
 
-        train_set 元素为 TrainSample（含 problem + 标准答案），反思据此区分对/错轨迹。
-
-        每轮：
-          1. TaskLM 跑训练集 → 轨迹+结果（用标准答案判对错）
-          2. ReflectionLM 反思 → 短期规律 + 长期策略
-          3. 写入知识库
-          4. 用长期策略迭代 TaskLM 的 prompt：生成候选策略→
-             在训练子集上打分→筛选保留最优→更新 TaskLM
-          5. 回到 1，共 n_iters 轮
-        """
+    def _train_classic(
+        self,
+        train_set: list[TrainSample],
+        n_iters: int,
+        candidates_per_iter: int,
+        verbose: bool,
+    ) -> list[dict]:
+        """Classic training loop: full-train run -> reflect -> evolve strategy."""
         history: list[dict] = []
         for it in range(1, n_iters + 1):
             if verbose:
                 print(f"\n=== Train iteration {it}/{n_iters} ===")
 
-            # 1) TaskLM 运行训练集（带当前策略 + 当前已有短期规律）
             traces: list[Trace] = []
             for sample in train_set:
-                # 训练期也可检索已积累的短期规律作为上下文
-                ctx_examples = self.kb.retrieve(
-                    sample.problem, k=self.top_k, threshold=self.match_threshold
-                )
+                ctx_examples = []
+                if self.train_retrieve_ctx:
+                    ctx_examples = self.kb.retrieve(
+                        sample.problem, k=self.top_k, threshold=self.match_threshold
+                    )
                 trace = self.task_lm.run(
                     sample.problem,
                     context_examples=ctx_examples,
@@ -130,16 +131,12 @@ class SROEngine:
                 )
                 traces.append(trace)
 
-            # 2) 反思
             short_patterns, long_strategy = self.reflection_lm.reflect(traces)
 
-            # 3) 写入知识库
             patterns_before = len(self.kb.examples)
             self.kb.add_patterns(short_patterns)
             patterns_after = len(self.kb.examples)
-            # 长期策略先暂存，下面用候选打分决定是否更新
 
-            # 4) 策略迭代：生成候选 → 打分 → 筛选
             best_strategy = self._evolve_strategy(
                 long_strategy, traces, train_set, candidates_per_iter
             )
@@ -149,7 +146,7 @@ class SROEngine:
             acc = (sum(t.result.correct for t in traces) / len(traces)
                    if traces else 0.0)
             record = {
-                "iteration": it,
+                "iteration": it, "evo_mode": "classic",
                 "accuracy": acc,
                 "new_patterns": len(short_patterns),
                 "patterns_total": patterns_after,
