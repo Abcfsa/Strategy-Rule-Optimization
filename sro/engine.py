@@ -43,14 +43,17 @@ class SROEngine:
         self.dynamic_learning = dynamic_learning
 
     def set_dataset(self, dataset: str) -> None:
-        """绑定数据集：把对应 evaluate_answer 注入 TaskLM.judger。
+        """绑定数据集：把对应 evaluate_answer 注入 TaskLM.judger，
+        并把该数据集的输出格式指令注入 TaskLM.dataset_format。
 
         dataset: gsm8k / math / aime / hotpotqa。判分逻辑复用
         openai_api_test 中已验证的函数，保证与基线一致。
         """
         from .datasets import _import_eval
+        from .llm import DATASET_FORMAT_INSTRUCTIONS
         judger, _ = _import_eval(dataset)
         self.task_lm.judger = judger
+        self.task_lm.dataset_format = DATASET_FORMAT_INSTRUCTIONS.get(dataset, "")
 
     # ===================================================================
     # 阶段一：训练与反思迭代

@@ -327,6 +327,39 @@ class Embedder:
 # ---------------------------------------------------------------------------
 
 
+# 每数据集的输出格式指令（让模型按评分器期望的格式给答案，避免抽取出错）。
+# 参考 gepa_aime_v2.py 的 INITIAL_WRITER_PROMPT 思路：明确告诉模型怎么输出。
+DATASET_FORMAT_INSTRUCTIONS = {
+    "gsm8k": (
+        "Solve the word problem step by step.\n"
+        "At the very end, output the final numerical answer on its own line as:\n"
+        "Answer: <number>\n"
+        "The answer must be a single number (integer, decimal, or fraction a/b), "
+        "with no units, currency symbols, commas, or extra text."
+    ),
+    "aime": (
+        "Solve the math problem step by step.\n"
+        "At the very end, output the final answer on its own line as:\n"
+        "Answer: <integer>\n"
+        "The answer must be a single integer between 0 and 999, with no units, "
+        "fractions, or decimal points."
+    ),
+    "math": (
+        "Solve the math problem step by step.\n"
+        "At the very end, put your final answer in LaTeX as: \\boxed{<answer>}.\n"
+        "The boxed answer should be the final simplified result (e.g. \\boxed{90}, "
+        "\\boxed{\\frac{1}{2}}, \\boxed{3\\sqrt{2}})."
+    ),
+    "hotpotqa": (
+        "Answer the question based on the context.\n"
+        "At the very end, output the final answer on its own line as:\n"
+        "Answer: <short answer>\n"
+        "The answer should be a concise entity name or short phrase (a few words), "
+        "as it would appear in a reading-comprehension answer span."
+    ),
+}
+
+
 class TaskLM:
     """任务模型封装，持有当前长期策略。
 
@@ -349,6 +382,9 @@ class TaskLM:
         # 判分回调：由 engine 注入对应数据集的 evaluate_answer。
         # 为 None 时回退到内置 is_correct（numeric/exact/freeform 简单判分）。
         self.judger: Optional[callable] = None
+        # 当前数据集的输出格式指令（由 engine.set_dataset 注入）。
+        # 为空字符串时退化为通用模板，保证 demo/无数据集场景可用。
+        self.dataset_format: str = ""
 
     def _call_llm(self, system: str, user: str) -> str:
         """真实模型调用。无 key 时由 _OpenAIClient 自动回退占位。"""
@@ -387,7 +423,11 @@ class TaskLM:
                      result=Result(answer=answer, correct=correct), context=ctx)
 
     def _assemble_system_prompt(self, few_shot: str) -> str:
-        parts = [self.strategy.text or "You are a careful problem solver."]
+        # 顺序：格式指令（数据集期望的输出方式）→ 长期策略 → few-shot 规律
+        base = self.dataset_format or "You are a careful problem solver."
+        parts = [base]
+        if self.strategy.text:
+            parts.append(self.strategy.text)
         if few_shot:
             parts.append("Relevant past experiences:\n" + few_shot)
         return "\n\n".join(parts)
