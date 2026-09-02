@@ -134,6 +134,8 @@ def _load_hotpotqa(n_train: int, n_val: int, seed: int):
     val_path = d / "hotpot_dev_distractor_v1.json"
 
     def _read(path, n):
+        if n <= 0:
+            raise ValueError(f"HotpotQA: n must be > 0, got n={n}")
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         rng = random.Random(seed)

@@ -34,6 +34,12 @@ DEFAULTS = {
     "TASK_MAX_CONTEXT_LEN": "0",
     "REFLECTION_MAX_CONTEXT_LEN": "0",
     "EXTRA_PARAMS": "",
+    # ---- 实验参数（数据规模 / 训练轮次 / 开关）----
+    "N_TRAIN": "50",
+    "N_VAL": "30",
+    "N_ITERS": "3",
+    "SEED": "42",
+    "DYNAMIC_LEARNING": "true",
     # ---- 检索 / 匹配 ----
     "EMBED_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
     "EMBED_DIM": "384",
@@ -69,6 +75,12 @@ class Config:
     task_max_context_len: int
     reflection_max_context_len: int
     extra_params: str
+    # 实验参数
+    n_train: int
+    n_val: int
+    n_iters: int
+    seed: int
+    dynamic_learning: bool
     embed_model: str
     embed_dim: int
     match_threshold: float
@@ -103,6 +115,11 @@ class Config:
             task_max_context_len=int(g("TASK_MAX_CONTEXT_LEN")),
             reflection_max_context_len=int(g("REFLECTION_MAX_CONTEXT_LEN")),
             extra_params=g("EXTRA_PARAMS"),
+            n_train=int(g("N_TRAIN")),
+            n_val=int(g("N_VAL")),
+            n_iters=int(g("N_ITERS")),
+            seed=int(g("SEED")),
+            dynamic_learning=_parse_bool(g("DYNAMIC_LEARNING")),
             embed_model=g("EMBED_MODEL"),
             embed_dim=int(g("EMBED_DIM")),
             match_threshold=float(g("MATCH_THRESHOLD")),

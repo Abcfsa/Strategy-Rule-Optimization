@@ -32,6 +32,7 @@ class SROEngine:
         kb: Optional[KnowledgeBase] = None,
         match_threshold: float = 0.6,   # 命中阈值
         top_k: int = 3,                   # 检索条数
+        dynamic_learning: bool = True,    # miss 时是否走动态学习
     ) -> None:
         self.embedder = embedder or Embedder()
         self.task_lm = task_lm or TaskLM(self.embedder)
@@ -39,6 +40,7 @@ class SROEngine:
         self.kb = kb or KnowledgeBase(self.embedder)
         self.match_threshold = match_threshold
         self.top_k = top_k
+        self.dynamic_learning = dynamic_learning
 
     def set_dataset(self, dataset: str) -> None:
         """绑定数据集：把对应 evaluate_answer 注入 TaskLM.judger。
@@ -60,8 +62,8 @@ class SROEngine:
         n_iters: int = 3,
         candidates_per_iter: int = 2,
         verbose: bool = True,
-    ) -> None:
-        """训练闭环。
+    ) -> list[dict]:
+        """训练闭环。返回每轮的历史记录（供输出保存用）。
 
         train_set 元素为 TrainSample（含 problem + 标准答案），反思据此区分对/错轨迹。
 
@@ -73,6 +75,7 @@ class SROEngine:
              在训练子集上打分→筛选保留最优→更新 TaskLM
           5. 回到 1，共 n_iters 轮
         """
+        history: list[dict] = []
         for it in range(1, n_iters + 1):
             if verbose:
                 print(f"\n=== Train iteration {it}/{n_iters} ===")
@@ -96,7 +99,9 @@ class SROEngine:
             short_patterns, long_strategy = self.reflection_lm.reflect(traces)
 
             # 3) 写入知识库
+            patterns_before = len(self.kb.examples)
             self.kb.add_patterns(short_patterns)
+            patterns_after = len(self.kb.examples)
             # 长期策略先暂存，下面用候选打分决定是否更新
 
             # 4) 策略迭代：生成候选 → 打分 → 筛选
@@ -106,12 +111,26 @@ class SROEngine:
             self.kb.update_strategy(best_strategy)
             self.task_lm.update_strategy(best_strategy)
 
+            acc = (sum(t.result.correct for t in traces) / len(traces)
+                   if traces else 0.0)
+            record = {
+                "iteration": it,
+                "accuracy": acc,
+                "new_patterns": len(short_patterns),
+                "patterns_total": patterns_after,
+                "patterns_added": patterns_after - patterns_before,
+                "strategy_version": best_strategy.version,
+                "strategy_score": best_strategy.score,
+                "strategy_text": best_strategy.text,
+            }
+            history.append(record)
+
             if verbose:
-                acc = sum(t.result.correct for t in traces) / len(traces)
                 print(f"  Accuracy this round: {acc:.2%}")
                 print(f"  New patterns: {len(short_patterns)}"
                       f" (total {len(self.kb.examples)})")
                 print(f"  Strategy version: v{best_strategy.version}")
+        return history
 
     def _evolve_strategy(
         self,
@@ -160,6 +179,7 @@ class SROEngine:
         """测试推理，含命中/不匹配两条分支。
 
         返回 (answer, meta)，meta 记录走了哪条分支、命中了哪些规律。
+        miss 时：若 dynamic_learning 开启则走动态学习，否则直接硬答。
         """
         # ---- 匹配机制：向量检索短期规律 ----
         hits = self.kb.retrieve(question, k=self.top_k,
@@ -176,9 +196,16 @@ class SROEngine:
             meta["dynamic_added"] = False
             if verbose:
                 print(f"[MATCH] hit {len(hits)} patterns -> answering directly")
-        else:
-            # ===== 不匹配分支：动态学习机制（架构图标注"待考虑"）=====
+        elif self.dynamic_learning:
+            # ===== 不匹配分支：动态学习机制 =====
             answer, trace = self._dynamic_learning(question, meta, verbose)
+        else:
+            # ===== 不匹配且关闭动态学习：直接用长期策略硬答 =====
+            trace = self.task_lm.run(question, context_examples=[])
+            answer = trace.result.answer
+            meta["dynamic_added"] = False
+            if verbose:
+                print("[MISS] dynamic learning OFF -> answering directly with strategy only")
 
         # 清理本轮临时规律，避免污染下一题
         self.kb.drop_tentative()
