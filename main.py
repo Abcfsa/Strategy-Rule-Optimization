@@ -71,6 +71,7 @@ def _save_outputs(
     val_correct = sum(1 for r in val_results if r["correct"])
     summary = {
         "dataset": dataset,
+        "evo_mode": run_params["evo_mode"],
         "n_train": run_params["n_train"],
         "n_val": run_params["n_val"],
         "n_iters": run_params["n_iters"],
@@ -79,9 +80,20 @@ def _save_outputs(
         "final_strategy_version": history[-1]["strategy_version"] if history else 0,
         "total_patterns": len(engine.kb.examples),
         "iterations": [
-            {"iteration": h["iteration"], "accuracy": h["accuracy"],
-             "new_patterns": h["new_patterns"], "patterns_total": h["patterns_total"],
-             "strategy_version": h["strategy_version"]}
+            {
+                "iteration": h["iteration"],
+                "evo_mode": h.get("evo_mode", "classic"),
+                "accuracy": h.get("accuracy"),
+                "new_patterns": h.get("new_patterns"),
+                "patterns_total": h.get("patterns_total"),
+                "strategy_version": h.get("strategy_version"),
+                # GEPA-only fields (None in classic mode)
+                "parent_idx": h.get("parent_idx"),
+                "old_minibatch": h.get("old_minibatch"),
+                "new_minibatch": h.get("new_minibatch"),
+                "new_val_score": h.get("new_val_score"),
+                "budget_used": h.get("budget_used"),
+            }
             for h in history
         ],
         "val_correct": val_correct,
@@ -124,6 +136,7 @@ def _save_outputs(
 def run_dataset(
     dataset: str, n_train: int, n_val: int, n_iters: int,
     seed: int, dynamic_learning: bool, output_dir: str | None,
+    evo_mode: str, train_retrieve_ctx: bool,
 ) -> None:
     """Load a real dataset and run the two-phase loop, then save outputs.
 
@@ -142,6 +155,9 @@ def run_dataset(
     engine = SROEngine(
         match_threshold=cfg.match_threshold, top_k=cfg.top_k,
         dynamic_learning=dynamic_learning,
+        evo_mode=evo_mode, train_retrieve_ctx=train_retrieve_ctx,
+        max_metric_calls=cfg.max_metric_calls, minibatch_size=cfg.minibatch_size,
+        max_prompt_length=cfg.max_prompt_length, seed=seed,
     )
     engine.set_dataset(dataset)   # inject the matching grader
 
@@ -176,6 +192,7 @@ def run_dataset(
     run_params = {
         "n_train": n_train, "n_val": n_val, "n_iters": n_iters,
         "seed": seed, "dynamic_learning": dynamic_learning,
+        "evo_mode": evo_mode, "train_retrieve_ctx": train_retrieve_ctx,
     }
     if output_dir is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -205,6 +222,15 @@ def main() -> None:
                         help="enable dynamic learning on miss (default from .env)")
     parser.add_argument("--no-dynamic", dest="dynamic_learning", action="store_false",
                         help="disable dynamic learning on miss")
+    parser.add_argument("--evo-mode", choices=["gepa", "classic"],
+                        default=cfg.evo_mode,
+                        help=f"evolution mode (default from .env: {cfg.evo_mode})")
+    parser.add_argument("--train-retrieve-ctx", action="store_true",
+                        default=cfg.train_retrieve_ctx,
+                        help="retrieve KB patterns during training (default from .env)")
+    parser.add_argument("--no-train-ctx", dest="train_retrieve_ctx",
+                        action="store_false",
+                        help="disable KB retrieval during training")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="output directory (default: sro_output_<dataset>_<timestamp>)")
     args = parser.parse_args()
@@ -213,7 +239,8 @@ def main() -> None:
         demo()
     elif args.dataset:
         run_dataset(args.dataset, args.n_train, args.n_val, args.n_iters,
-                    args.seed, args.dynamic_learning, args.output_dir)
+                    args.seed, args.dynamic_learning, args.output_dir,
+                    args.evo_mode, args.train_retrieve_ctx)
     else:
         parser.print_help()
 
