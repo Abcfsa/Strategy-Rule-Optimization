@@ -266,6 +266,9 @@ class SROEngine:
         import random
         from .pareto import build_pareto_fronts, select_candidate_from_pareto_front
 
+        if verbose:
+            print("[Info] GEPA mode is budget-controlled (max_metric_calls); n_iters is ignored.")
+
         rng = random.Random(self.seed)
         # Pareto validation subset: cut 1/4 of train for internal Pareto validation.
         # The real val split is reserved for final evaluation in main.py.
