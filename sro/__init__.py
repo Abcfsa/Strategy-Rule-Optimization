@@ -23,6 +23,12 @@ from .knowledge import KnowledgeBase
 from .engine import SROEngine
 from .config import Config, get_config
 from . import datasets  # noqa: F401  数据集加载（按需 import 数据库）
+from .pareto import (
+    build_pareto_fronts,
+    is_dominated,
+    remove_dominated_programs,
+    select_candidate_from_pareto_front,
+)
 
 __all__ = [
     "TaskLM",
@@ -37,4 +43,8 @@ __all__ = [
     "SROEngine",
     "Config",
     "get_config",
+    "build_pareto_fronts",
+    "is_dominated",
+    "remove_dominated_programs",
+    "select_candidate_from_pareto_front",
 ]
