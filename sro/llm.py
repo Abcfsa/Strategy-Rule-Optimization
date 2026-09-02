@@ -67,12 +67,18 @@ class Example:
 
 @dataclass
 class Strategy:
-    """长期策略（System Prompt 级别的高级方法论）。"""
+    """长期策略（System Prompt 级别的高级方法论）。
+
+    GEPA 模式下 val_scores 携带逐样本验证分数（供 Pareto 前沿用），
+    parent_idx 追踪候选池谱系；非 GEPA 模式不碰这两个字段。
+    """
 
     text: str                             # 策略正文
-    score: float = 0.0                    # 该策略在验证集上的得分
+    score: float = 0.0                    # 该策略在验证集上的得分（GEPA 用 mean）
     version: int = 0                      # 迭代版本号
     parent_version: int = 0              # 由哪个版本演化而来
+    val_scores: list[float] = field(default_factory=list)  # GEPA 逐样本 val 分数
+    parent_idx: Optional[int] = None      # GEPA 候选池父索引
 
 
 @dataclass
