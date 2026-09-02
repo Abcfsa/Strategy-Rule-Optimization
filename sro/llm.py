@@ -191,28 +191,44 @@ class _OpenAIClient:
 
     @staticmethod
     def _needs_stream(kwargs: dict) -> bool:
-        """开了 thinking 的模型族必须走流式（端点硬性要求）。"""
-        eb = kwargs.get("extra_body", {})
-        return eb.get("enable_thinking") is True or eb.get("reasoning") is True
+        """需要走流式的情形（对齐 gepa_aime_v3._chat_complete）。
+
+        - extra_body 里存在 enable_thinking 键（不论 True/False）：
+          qwen3 即使设 False 也得走流式，否则端点报 400
+          "enable_thinking only support stream call"
+        - extra_body 里存在 reasoning 键（GLM 同理）
+        - 显式 stream=True
+        """
+        eb = kwargs.get("extra_body") or {}
+        return ("enable_thinking" in eb
+                or "reasoning" in eb
+                or kwargs.get("stream") is True)
 
     @staticmethod
     def _aggregate_stream(stream) -> str:
-        """聚合流式 delta：取 content，为空则回退 reasoning_content。"""
+        """聚合流式 delta：取 content，为空则回退 reasoning_content。
+
+        用 getattr 防 usage/role 等无 choices 字段的 chunk 抛异常
+        （对齐 gepa_aime_v3 的健壮写法）。
+        """
         parts: list[str] = []
         reasoning_parts: list[str] = []
         for chunk in stream:
-            if not chunk.choices:
+            choices = getattr(chunk, "choices", None)
+            if not choices:
                 continue
-            delta = chunk.choices[0].delta
-            if getattr(delta, "content", None):
-                parts.append(delta.content)
-            rc = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
-            if rc:
-                reasoning_parts.append(rc)
-        content = "".join(parts)
-        if content.strip():
-            return content
-        # 模型全输出到 reasoning 时回退，保证有东西可抽答案
+            delta = choices[0].delta
+            c = getattr(delta, "content", None)
+            if c:
+                parts.append(c)
+            r = (getattr(delta, "reasoning_content", None)
+                 or getattr(delta, "reasoning", None))
+            if r:
+                reasoning_parts.append(r)
+        text = "".join(parts)
+        if text.strip():
+            return text
+        # 某些模型把全部输出放在 reasoning_content，回退保证有东西可抽答案
         return "".join(reasoning_parts)
 
     def chat(self, model: str, system: str, user: str, *,
