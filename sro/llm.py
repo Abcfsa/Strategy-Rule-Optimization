@@ -623,6 +623,75 @@ class ReflectionLM:
             extra_params=self.extra_params,
         )
 
+    # ---- GEPA 辅助：静态工具方法 ----
+    @staticmethod
+    def _count_reasoning_steps(reasoning: str) -> int:
+        """Roughly count reasoning steps (by sentence / newline / markers)."""
+        if not reasoning:
+            return 0
+        import re
+        segments = re.split(
+            r'[.\n]|(?:Step\s*\d+)|(?:First|Second|Next|Finally|Therefore)',
+            reasoning, flags=re.IGNORECASE)
+        return max(1, len([s for s in segments if s.strip()]))
+
+    @staticmethod
+    def _classify_error_type(prediction: str, ground_truth: str,
+                             reasoning: str) -> str:
+        """Generic error classification (dataset-agnostic).
+
+        v3's version is AIME-specific (checks 0-999 integer range); here we
+        degrade to a simple two-way split for non-AIME datasets, avoiding
+        hardcoded AIME assumptions in the general flow.
+        """
+        if not prediction or not prediction.strip():
+            return "no_answer_extracted"
+        return "wrong_answer"
+
+    # ---- GEPA 辅助：诊断反馈与错误聚类 ----
+    def _build_diagnostic_feedback(self, traces: list[Trace]) -> str:
+        """Build diagnostic feedback text from minibatch traces.
+
+        Adapts v3's _build_diagnostic_feedback to SRO's Trace objects.
+        """
+        lines = []
+        for i, t in enumerate(traces):
+            status = "CORRECT" if t.result.correct else "WRONG"
+            error_type = "" if t.result.correct else self._classify_error_type(
+                t.result.answer, "", t.trajectory)
+            entry = (
+                f"--- Example {i+1} [{status}]"
+                f"{f'  Error type: {error_type}' if error_type else ''}\n"
+                f"Problem: {t.problem}\n"
+                f"Model's full reasoning:\n{t.trajectory}\n"
+                f"Model's answer: {t.result.answer}\n"
+                f"Correct answer: {t.context.get('gold_answer', 'N/A')}\n"
+            )
+            if not t.result.correct:
+                entry += (
+                    f"Diagnosis: The model produced {error_type.replace('_', ' ')}. "
+                    f"Reasoning length: {self._count_reasoning_steps(t.trajectory)} estimated steps. "
+                    f"Got '{t.result.answer}'.\n"
+                )
+            lines.append(entry)
+        return "\n".join(lines)
+
+    def _cluster_error_patterns(self, traces: list[Trace]) -> str:
+        """Cross-sample error pattern clustering summary."""
+        errors = [t for t in traces if not t.result.correct]
+        if not errors:
+            return "No errors in this batch."
+
+        error_types = {}
+        for t in errors:
+            et = self._classify_error_type(t.result.answer, "", t.trajectory)
+            error_types[et] = error_types.get(et, 0) + 1
+
+        summary_lines = [f"Error pattern summary ({len(errors)} wrong out of {len(traces)}):"]
+        for et, count in sorted(error_types.items(), key=lambda x: -x[1]):
+            summary_lines.append(f"  - {et.replace('_', ' ')}: {count} case(s)")
+        return "\n".join(summary_lines)
+
     # ---- 阶段一：批量反思 ----
     def reflect(self, traces: list[Trace]) -> tuple[list[Example], Strategy]:
         """分析一批轨迹，产出短期规律 + 长期策略。
@@ -679,6 +748,43 @@ class ReflectionLM:
 
         long_strategy = Strategy(text=long_text, version=1)
         return patterns, long_strategy
+
+    # ---- GEPA 反思：生成新策略 ----
+    def reflect_gepa(self, parent: Strategy, minibatch_traces: list[Trace],
+                     iteration: int) -> str:
+        """GEPA-style reflection: diagnostic feedback + error clustering -> new strategy text.
+
+        Returns new prompt text (complete replacement). Caller cleans markdown
+        fences and validates length. Uses v3's build_reflection_prompt structure
+        but generalizes 'AIME' to 'the task' for multi-dataset support.
+        """
+        detailed_traces = self._build_diagnostic_feedback(minibatch_traces)
+        error_summary = self._cluster_error_patterns(minibatch_traces)
+        reflection_prompt = (
+            f"I provided an assistant with the following instruction to solve the task:\n\n"
+            f"```\n{parent.text}\n```\n\n"
+            f"The following are examples of different task inputs provided to the assistant\n"
+            f"along with the assistant's response for each of them, and some feedback on\n"
+            f"how the assistant's response could be better:\n\n"
+            f"```\n{detailed_traces}\n```\n\n"
+            f"---\n"
+            f"Error pattern summary across the batch:\n"
+            f"{error_summary}\n"
+            f"---\n\n"
+            f"Your task is to write a new instruction for the assistant.\n\n"
+            f"Analyze the execution traces and feedback above:\n"
+            f"1. Identify the root causes of failures — are they reasoning gaps, format issues,\n"
+            f"   or missing verification steps?\n"
+            f"2. Note any successful strategies the assistant used on correct examples.\n"
+            f"3. Include any generalizable problem-solving heuristics that the current\n"
+            f"   instruction omits.\n"
+            f"4. Propose strategies the assistant can apply to unseen problems.\n\n"
+            f"Provide the new instruction within ``` blocks.\n"
+            f"The new instruction must be a complete replacement (not a diff or patch).\n"
+            f"Do NOT include explanations — only the new instruction."
+        )
+        sys = ("You are an expert prompt engineer. Return ONLY the new instruction text.")
+        return self._call_llm(system=sys, user=reflection_prompt)
 
     # ---- 阶段二：单题动态归纳 ----
     def extract_pattern_from_question(self, question: str) -> Example:
