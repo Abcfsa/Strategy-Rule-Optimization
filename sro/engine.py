@@ -21,6 +21,26 @@ from .llm import (
 from .knowledge import KnowledgeBase
 
 
+def _clean_markdown(text: str) -> str:
+    """Strip ``` code fence wrapping from reflection output."""
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return text
+
+
+def _default_prompt() -> str:
+    """GEPA mode initial prompt when no strategy is set (generic, not AIME-specific)."""
+    return (
+        "You are an expert problem solver. Read the problem carefully, reason "
+        "step by step, and produce the final answer in the format specified by "
+        "the task. Double-check your answer before outputting it."
+    )
+
+
 class SROEngine:
     """系统编排器，持有两个 LM 与一个共享知识库。"""
 
@@ -31,8 +51,14 @@ class SROEngine:
         embedder: Optional[Embedder] = None,
         kb: Optional[KnowledgeBase] = None,
         match_threshold: float = 0.6,   # 命中阈值
-        top_k: int = 3,                   # 检索条数
-        dynamic_learning: bool = True,    # miss 时是否走动态学习
+        top_k: int = 3,                  # 检索条数
+        dynamic_learning: bool = True,   # miss 时是否走动态学习
+        evo_mode: str = "classic",
+        train_retrieve_ctx: bool = True,
+        max_metric_calls: int = 150,
+        minibatch_size: int = 8,
+        max_prompt_length: int = 2000,
+        seed: int = 42,
     ) -> None:
         self.embedder = embedder or Embedder()
         self.task_lm = task_lm or TaskLM(self.embedder)
@@ -41,6 +67,12 @@ class SROEngine:
         self.match_threshold = match_threshold
         self.top_k = top_k
         self.dynamic_learning = dynamic_learning
+        self.evo_mode = evo_mode
+        self.train_retrieve_ctx = train_retrieve_ctx
+        self.max_metric_calls = max_metric_calls
+        self.minibatch_size = minibatch_size
+        self.max_prompt_length = max_prompt_length
+        self.seed = seed
 
     def set_dataset(self, dataset: str) -> None:
         """绑定数据集：把对应 evaluate_answer 注入 TaskLM.judger，
