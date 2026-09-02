@@ -203,6 +203,207 @@ class SROEngine:
         self.task_lm.update_strategy(original_strategy)
         return best
 
+    # -------------------------------------------------------------------
+    # GEPA 辅助方法（_train_gepa 内部使用）
+    # -------------------------------------------------------------------
+
+    def _run_minibatch(self, strategy: Strategy,
+                       minibatch: list[TrainSample]) -> list[Trace]:
+        """Temporarily swap in strategy, run minibatch, restore. Returns traces.
+
+        train_retrieve_ctx controls whether KB patterns are retrieved as context.
+        gold_answer is injected into trace.context for diagnostic feedback.
+        """
+        original = self.task_lm.strategy
+        self.task_lm.update_strategy(strategy)
+        traces: list[Trace] = []
+        for sample in minibatch:
+            ctx_examples = []
+            if self.train_retrieve_ctx:
+                ctx_examples = self.kb.retrieve(
+                    sample.problem, k=self.top_k, threshold=self.match_threshold
+                )
+            trace = self.task_lm.run(
+                sample.problem,
+                context_examples=ctx_examples,
+                gold_answer=sample.answer,
+                answer_type=sample.answer_type,
+            )
+            # inject gold_answer into context for reflect_gepa diagnostic feedback
+            trace.context["gold_answer"] = sample.answer
+            traces.append(trace)
+        self.task_lm.update_strategy(original)
+        return traces
+
+    def _eval_candidate(self, strategy: Strategy,
+                        val_subset: list[TrainSample]) -> list[float]:
+        """Run strategy on val_subset, return per-sample 1.0/0.0 scores."""
+        original = self.task_lm.strategy
+        self.task_lm.update_strategy(strategy)
+        scores: list[float] = []
+        for sample in val_subset:
+            trace = self.task_lm.run(
+                sample.problem,
+                context_examples=[],  # val eval: no KB context, pure strategy
+                gold_answer=sample.answer,
+                answer_type=sample.answer_type,
+            )
+            scores.append(1.0 if trace.result.correct else 0.0)
+        self.task_lm.update_strategy(original)
+        return scores
+
+    # -------------------------------------------------------------------
+    # GEPA 核心训练循环
+    # -------------------------------------------------------------------
+
+    def _train_gepa(self, train_set: list[TrainSample],
+                    verbose: bool) -> list[dict]:
+        """GEPA-style training: Pareto front + minibatch + budget + keep-better.
+
+        Mirrors gepa_aime_v3.py main loop. KB coexists: short patterns from
+        reflection are added to KB alongside the Pareto candidate pool.
+        """
+        import random
+        from .pareto import build_pareto_fronts, select_candidate_from_pareto_front
+
+        rng = random.Random(self.seed)
+        # Pareto validation subset: cut 1/4 of train for internal Pareto validation.
+        # The real val split is reserved for final evaluation in main.py.
+        n_val = max(1, len(train_set) // 4)
+        val_for_pareto = train_set[:n_val]
+        train_pool = train_set[n_val:]
+        if not train_pool:
+            train_pool = list(train_set)  # degenerate: all used as both
+        budget_used = 0
+        history: list[dict] = []
+
+        # Step 1: initialize candidate pool
+        init_text = self.task_lm.strategy.text or _default_prompt()
+        candidates: list[Strategy] = [Strategy(text=init_text, version=0)]
+        candidates[0].val_scores = self._eval_candidate(candidates[0], val_for_pareto)
+        candidates[0].score = sum(candidates[0].val_scores) / n_val
+        budget_used += n_val
+        pareto_fronts = build_pareto_fronts(
+            [c.val_scores for c in candidates], n_val)
+        best_idx, best_score = 0, candidates[0].score
+
+        if verbose:
+            print(f"[Init] Base candidate val score: {best_score:.2%}"
+                  f" ({n_val} calls)")
+            print(f"[Budget] Used: {budget_used}/{self.max_metric_calls}")
+
+        # Step 2: budget-controlled main loop
+        while budget_used < self.max_metric_calls:
+            iteration = len(history) + 1
+            if verbose:
+                print(f"\n=== GEPA iteration {iteration}"
+                      f" (budget {budget_used}/{self.max_metric_calls}) ===")
+
+            try:
+                # 2a) Pareto select parent
+                scores_map = {i: c.score for i, c in enumerate(candidates)}
+                parent_idx = select_candidate_from_pareto_front(
+                    pareto_fronts, scores_map, rng)
+                parent = candidates[parent_idx]
+                if verbose:
+                    print(f"[Select] Parent: candidate #{parent_idx}"
+                          f" (val={parent.score:.2%})")
+
+                # 2b) minibatch sample
+                mb_size = min(self.minibatch_size, len(train_pool))
+                minibatch = rng.sample(train_pool, mb_size)
+
+                # 2c) parent runs minibatch (with traces)
+                old_traces = self._run_minibatch(parent, minibatch)
+                budget_used += mb_size
+                old_sum = sum(t.result.correct for t in old_traces)
+                if all(t.result.correct for t in old_traces):
+                    if verbose:
+                        print("[Skip] All minibatch correct, skipping.")
+                    continue
+                if verbose:
+                    print(f"[Eval] Parent minibatch:"
+                          f" {old_sum}/{len(minibatch)}"
+                          f" ({mb_size} calls)")
+
+                # 2d) reflection -> new strategy text
+                new_text = self.reflection_lm.reflect_gepa(
+                    parent, old_traces, iteration)
+                new_text = _clean_markdown(new_text)
+                if not new_text or new_text == parent.text:
+                    if verbose:
+                        print("[Reject] Reflection empty or identical.")
+                    continue
+                if len(new_text) > self.max_prompt_length:
+                    if verbose:
+                        print(f"[Reject] Too long ({len(new_text)}"
+                              f" > {self.max_prompt_length}).")
+                    continue
+
+                # 2e) new candidate runs same minibatch
+                new_strat = Strategy(
+                    text=new_text, version=len(candidates),
+                    parent_idx=parent_idx)
+                new_traces = self._run_minibatch(new_strat, minibatch)
+                budget_used += mb_size
+                new_sum = sum(t.result.correct for t in new_traces)
+
+                # 2f) strict improvement acceptance
+                if new_sum <= old_sum:
+                    if verbose:
+                        print(f"[Reject] No improvement"
+                              f" ({new_sum} <= {old_sum}).")
+                    continue
+
+                # 2g) accept -> full val eval -> update Pareto
+                new_strat.val_scores = self._eval_candidate(
+                    new_strat, val_for_pareto)
+                budget_used += n_val
+                new_strat.score = sum(new_strat.val_scores) / n_val
+                candidates.append(new_strat)
+                pareto_fronts = build_pareto_fronts(
+                    [c.val_scores for c in candidates], n_val)
+                if verbose:
+                    print(f"[Accept] Candidate #{len(candidates) - 1}"
+                          f" val={new_strat.score:.2%}")
+                if new_strat.score > best_score:
+                    best_idx = len(candidates) - 1
+                    best_score = new_strat.score
+                    if verbose:
+                        print(f"  * New best! ({best_score:.2%})")
+
+                # 2h) short patterns from reflection -> KB (coexistence)
+                patterns, _ = self.reflection_lm.reflect(
+                    old_traces + new_traces)
+                self.kb.add_patterns(patterns)
+
+                history.append({
+                    "iteration": iteration, "evo_mode": "gepa",
+                    "parent_idx": parent_idx,
+                    "old_minibatch": old_sum, "new_minibatch": new_sum,
+                    "new_val_score": new_strat.score,
+                    "accepted": True, "budget_used": budget_used,
+                    "strategy_version": new_strat.version,
+                    "strategy_text": new_strat.text,
+                })
+
+            except Exception as e:
+                if verbose:
+                    print(f"[Error] iteration {iteration}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                break
+
+        # Step 3: best candidate updates TaskLM
+        best = candidates[best_idx]
+        self.kb.update_strategy(best)
+        self.task_lm.update_strategy(best)
+        if verbose:
+            print(f"\n[Done] Best candidate #{best_idx}"
+                  f" val={best_score:.2%}, budget"
+                  f" {budget_used}/{self.max_metric_calls}")
+        return history
+
     # ===================================================================
     # 阶段二：测试与推理
     # ===================================================================
