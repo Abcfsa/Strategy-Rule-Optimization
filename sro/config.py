@@ -40,6 +40,12 @@ DEFAULTS = {
     "N_ITERS": "3",
     "SEED": "42",
     "DYNAMIC_LEARNING": "true",
+    # ---- GEPA 进化模式参数 ----
+    "EVO_MODE": "classic",
+    "TRAIN_RETRIEVE_CTX": "true",
+    "MAX_METRIC_CALLS": "150",
+    "MINIBATCH_SIZE": "8",
+    "MAX_PROMPT_LENGTH": "2000",
     # ---- 检索 / 匹配 ----
     "EMBED_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
     "EMBED_DIM": "384",
@@ -81,6 +87,11 @@ class Config:
     n_iters: int
     seed: int
     dynamic_learning: bool
+    evo_mode: str
+    train_retrieve_ctx: bool
+    max_metric_calls: int
+    minibatch_size: int
+    max_prompt_length: int
     embed_model: str
     embed_dim: int
     match_threshold: float
@@ -120,6 +131,11 @@ class Config:
             n_iters=int(g("N_ITERS")),
             seed=int(g("SEED")),
             dynamic_learning=_parse_bool(g("DYNAMIC_LEARNING")),
+            evo_mode=g("EVO_MODE"),
+            train_retrieve_ctx=_parse_bool(g("TRAIN_RETRIEVE_CTX")),
+            max_metric_calls=int(g("MAX_METRIC_CALLS")),
+            minibatch_size=int(g("MINIBATCH_SIZE")),
+            max_prompt_length=int(g("MAX_PROMPT_LENGTH")),
             embed_model=g("EMBED_MODEL"),
             embed_dim=int(g("EMBED_DIM")),
             match_threshold=float(g("MATCH_THRESHOLD")),
