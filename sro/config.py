@@ -56,6 +56,7 @@ DEFAULTS = {
     "MATH_PATH": "",
     "HOTPOTQA_PATH": "",
     "AIME_PATH": "",
+    "AIME_GEPA_SPLIT": "false",
 }
 
 
@@ -102,6 +103,7 @@ class Config:
     math_path: str = ""
     hotpotqa_path: str = ""
     aime_path: str = ""
+    aime_gepa_split: bool = False
 
     @property
     def has_api_key(self) -> bool:
@@ -147,6 +149,7 @@ class Config:
             math_path=g("MATH_PATH"),
             hotpotqa_path=g("HOTPOTQA_PATH"),
             aime_path=g("AIME_PATH"),
+            aime_gepa_split=_parse_bool(g("AIME_GEPA_SPLIT")),
         )
 
 

@@ -137,6 +137,7 @@ def run_dataset(
     dataset: str, n_train: int, n_val: int, n_iters: int,
     seed: int, dynamic_learning: bool, output_dir: str | None,
     evo_mode: str, train_retrieve_ctx: bool, test_use_patterns: bool,
+    aime_gepa_split: bool = False,
 ) -> None:
     """Load a real dataset and run the two-phase loop, then save outputs.
 
@@ -149,7 +150,8 @@ def run_dataset(
         print("[WARN] OPENAI_API_KEY not set; using placeholder LM (data-flow demo only).")
 
     print(f"########## Loading dataset: {dataset} ##########")
-    train, val = load(dataset, n_train=n_train, n_val=n_val, seed=seed)
+    train, val = load(dataset, n_train=n_train, n_val=n_val, seed=seed,
+                      gepa_split=aime_gepa_split)
     print(f"  train: {len(train)} samples | val: {len(val)} samples")
 
     engine = SROEngine(
@@ -160,7 +162,7 @@ def run_dataset(
         max_metric_calls=cfg.max_metric_calls, minibatch_size=cfg.minibatch_size,
         max_prompt_length=cfg.max_prompt_length, seed=seed,
     )
-    engine.set_dataset(dataset)   # inject the matching grader
+    engine.set_dataset(dataset, gepa_split=aime_gepa_split)   # inject the matching grader
 
     print(f"\n########## Phase 1: Training & Reflection Loop ({n_iters} iters) ##########")
     history = engine.train_and_reflect(train, n_iters=n_iters, verbose=True)
@@ -195,6 +197,7 @@ def run_dataset(
         "seed": seed, "dynamic_learning": dynamic_learning,
         "test_use_patterns": test_use_patterns,
         "evo_mode": evo_mode, "train_retrieve_ctx": train_retrieve_ctx,
+        "aime_gepa_split": aime_gepa_split,
     }
     if output_dir is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -238,6 +241,9 @@ def main() -> None:
     parser.add_argument("--no-train-ctx", dest="train_retrieve_ctx",
                         action="store_false",
                         help="disable KB retrieval during training")
+    parser.add_argument("--aime-gepa-split", action="store_true",
+                        default=cfg.aime_gepa_split,
+                        help="AIME only: replicate GEPA init_dataset() split (seed=0, half/half, ### answer prefix)")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="output directory (default: sro_output_<dataset>_<timestamp>)")
     args = parser.parse_args()
@@ -247,7 +253,8 @@ def main() -> None:
     elif args.dataset:
         run_dataset(args.dataset, args.n_train, args.n_val, args.n_iters,
                     args.seed, args.dynamic_learning, args.output_dir,
-                    args.evo_mode, args.train_retrieve_ctx, args.test_use_patterns)
+                    args.evo_mode, args.train_retrieve_ctx, args.test_use_patterns,
+                    args.aime_gepa_split)
     else:
         parser.print_help()
 

@@ -350,6 +350,15 @@ DATASET_FORMAT_INSTRUCTIONS = {
         "The answer must be a single integer between 0 and 999, with no units, "
         "fractions, or decimal points."
     ),
+    # GEPA 对齐版：要求 ### 前缀格式，与 GEPA init_dataset() 的答案格式一致
+    "aime_gepa": (
+        "Solve the math problem step by step.\n"
+        "At the very end, output the final answer at the end of your response "
+        "in exactly the format:\n"
+        "### <integer>\n"
+        "The answer must be a single integer between 0 and 999, with no units, "
+        "fractions, or decimal points."
+    ),
     "math": (
         "Solve the math problem step by step.\n"
         "At the very end, put your final answer in LaTeX as: \\boxed{<answer>}.\n"

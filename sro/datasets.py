@@ -104,8 +104,14 @@ def _load_math(n_train: int, n_val: int, seed: int):
     return _shuffle_split(items, n_train, n_val, seed)
 
 
-def _load_aime(n_train: int, n_val: int, seed: int):
-    """AIME：本地 Arrow，aimo-validation-aime 作为 train+val 池。"""
+def _load_aime(n_train: int, n_val: int, seed: int, gepa_split: bool = False):
+    """AIME：本地 Arrow，aimo-validation-aime 作为 train+val 池。
+
+    gepa_split=True 时完全复刻 GEPA 的 init_dataset() 划分：
+    - 固定 random.Random(0) 打乱（忽略 seed 参数）
+    - 对半切：前半=train，后半=val（忽略 n_train/n_val）
+    - 答案加 "### " 前缀（GEPA 的答案格式）
+    """
     try:
         from datasets import Dataset
     except ImportError as e:
@@ -121,6 +127,21 @@ def _load_aime(n_train: int, n_val: int, seed: int):
         answer = str(it.get("answer", "")).strip()
         if problem and answer:
             items.append(TrainSample(problem=problem, answer=answer, answer_type="numeric"))
+
+    if gepa_split:
+        # 复刻 GEPA init_dataset(): random.Random(0) 打乱 + 对半切 + ### 前缀
+        import random as _r
+        _r.Random(0).shuffle(items)
+        mid = len(items) // 2
+        train = items[:mid]
+        val = items[mid:]
+        prefix = "### "
+        for t in train:
+            t.answer = prefix + t.answer
+        for t in val:
+            t.answer = prefix + t.answer
+        return train, val
+
     return _shuffle_split(items, n_train, n_val, seed)
 
 
@@ -162,13 +183,18 @@ _LOADERS = {
 }
 
 
-def load(dataset: str, n_train: int = 50, n_val: int = 30, seed: int = 42):
+def load(dataset: str, n_train: int = 50, n_val: int = 30, seed: int = 42,
+         gepa_split: bool = False):
     """加载指定数据集，返回 (train, val): tuple[list[TrainSample], list[TrainSample]]。
 
     dataset: gsm8k / math / aime / hotpotqa
+
+    gepa_split: 仅 aime 生效，完全复刻 GEPA init_dataset() 划分（seed=0 + 对半切 + ### 前缀）。
     """
     if dataset not in _LOADERS:
         raise ValueError(f"unknown dataset '{dataset}'; choose from {list(_LOADERS)}")
+    if dataset == "aime":
+        return _LOADERS[dataset](n_train, n_val, seed, gepa_split=gepa_split)
     return _LOADERS[dataset](n_train, n_val, seed)
 
 
