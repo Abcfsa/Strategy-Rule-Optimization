@@ -136,7 +136,7 @@ def _save_outputs(
 def run_dataset(
     dataset: str, n_train: int, n_val: int, n_iters: int,
     seed: int, dynamic_learning: bool, output_dir: str | None,
-    evo_mode: str, train_retrieve_ctx: bool,
+    evo_mode: str, train_retrieve_ctx: bool, test_use_patterns: bool,
 ) -> None:
     """Load a real dataset and run the two-phase loop, then save outputs.
 
@@ -155,6 +155,7 @@ def run_dataset(
     engine = SROEngine(
         match_threshold=cfg.match_threshold, top_k=cfg.top_k,
         dynamic_learning=dynamic_learning,
+        test_use_patterns=test_use_patterns,
         evo_mode=evo_mode, train_retrieve_ctx=train_retrieve_ctx,
         max_metric_calls=cfg.max_metric_calls, minibatch_size=cfg.minibatch_size,
         max_prompt_length=cfg.max_prompt_length, seed=seed,
@@ -192,6 +193,7 @@ def run_dataset(
     run_params = {
         "n_train": n_train, "n_val": n_val, "n_iters": n_iters,
         "seed": seed, "dynamic_learning": dynamic_learning,
+        "test_use_patterns": test_use_patterns,
         "evo_mode": evo_mode, "train_retrieve_ctx": train_retrieve_ctx,
     }
     if output_dir is None:
@@ -222,6 +224,11 @@ def main() -> None:
                         help="enable dynamic learning on miss (default from .env)")
     parser.add_argument("--no-dynamic", dest="dynamic_learning", action="store_false",
                         help="disable dynamic learning on miss")
+    parser.add_argument("--test-use-patterns", action="store_true",
+                        default=cfg.test_use_patterns,
+                        help="inject KB short-term patterns as context at test time (default from .env)")
+    parser.add_argument("--no-test-patterns", dest="test_use_patterns", action="store_false",
+                        help="disable injecting short-term patterns as context at test time")
     parser.add_argument("--evo-mode", choices=["gepa", "classic"],
                         default=cfg.evo_mode,
                         help=f"evolution mode (default from .env: {cfg.evo_mode})")
@@ -240,7 +247,7 @@ def main() -> None:
     elif args.dataset:
         run_dataset(args.dataset, args.n_train, args.n_val, args.n_iters,
                     args.seed, args.dynamic_learning, args.output_dir,
-                    args.evo_mode, args.train_retrieve_ctx)
+                    args.evo_mode, args.train_retrieve_ctx, args.test_use_patterns)
     else:
         parser.print_help()
 

@@ -53,6 +53,7 @@ class SROEngine:
         match_threshold: float = 0.6,   # 命中阈值
         top_k: int = 3,                  # 检索条数
         dynamic_learning: bool = True,   # miss 时是否走动态学习
+        test_use_patterns: bool = True,  # 测试时是否注入短期规律作 context
         evo_mode: str = "classic",
         train_retrieve_ctx: bool = True,
         max_metric_calls: int = 150,
@@ -67,6 +68,7 @@ class SROEngine:
         self.match_threshold = match_threshold
         self.top_k = top_k
         self.dynamic_learning = dynamic_learning
+        self.test_use_patterns = test_use_patterns
         self.evo_mode = evo_mode
         self.train_retrieve_ctx = train_retrieve_ctx
         self.max_metric_calls = max_metric_calls
@@ -418,8 +420,11 @@ class SROEngine:
         miss 时：若 dynamic_learning 开启则走动态学习，否则直接硬答。
         """
         # ---- 匹配机制：向量检索短期规律 ----
-        hits = self.kb.retrieve(question, k=self.top_k,
-                                threshold=self.match_threshold)
+        if self.test_use_patterns:
+            hits = self.kb.retrieve(question, k=self.top_k,
+                                    threshold=self.match_threshold)
+        else:
+            hits = []
         hit = bool(hits)
 
         meta: dict = {"branch": "match" if hit else "miss",
@@ -465,8 +470,11 @@ class SROEngine:
         # 3) 第二轮测试：用长期策略 + 这条临时规律重新检索并回答
         if verbose:
             print("[MISS] dynamic learning triggered: induce temporary pattern -> second-round attempt")
-        hits = self.kb.retrieve(question, k=self.top_k,
-                               threshold=0.0)  # 临时放宽，确保取到刚加的
+        if self.test_use_patterns:
+            hits = self.kb.retrieve(question, k=self.top_k,
+                                   threshold=0.0)  # 临时放宽，确保取到刚加的
+        else:
+            hits = []  # test_use_patterns 关闭：规律照归纳入 KB，但不注入 context
         trace = self.task_lm.run(question, context_examples=hits)
 
         meta["dynamic_added"] = True
