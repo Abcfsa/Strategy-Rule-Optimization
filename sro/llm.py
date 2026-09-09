@@ -786,6 +786,66 @@ class ReflectionLM:
         sys = ("You are an expert prompt engineer. Return ONLY the new instruction text.")
         return self._call_llm(system=sys, user=reflection_prompt)
 
+    # ---- GEPA merge：融合两个策略的优势 ----
+    def merge_strategies(
+        self,
+        ancestor: Strategy,
+        parent_a: Strategy,
+        parent_b: Strategy,
+        traces_a: list[Trace],
+        traces_b: list[Trace],
+        iteration: int,
+    ) -> str:
+        """LLM 融合两个策略的互补优势，返回完整替换文本。
+
+        适配 GEPA merge 的"取各自进化的部分"语义到单文本域：
+        GEPA 逐组件判断 ancestor==a 取 b；SRO 策略是自由文本无组件边界，
+        改用 LLM 语义识别哪方改进了哪方面。诊断 traces 的角色等同
+        GEPA 的逐预测器分数对比——告诉 LLM 哪方在哪方面更强。
+        """
+        diag_a = self._build_diagnostic_feedback(traces_a)
+        diag_b = self._build_diagnostic_feedback(traces_b)
+        err_a = self._cluster_error_patterns(traces_a)
+        err_b = self._cluster_error_patterns(traces_b)
+        merge_prompt = (
+            f"You are given three versions of an instruction for an assistant.\n\n"
+            f"## Ancestor instruction (the original both variants descended from):\n"
+            f"```\n{ancestor.text}\n```\n\n"
+            f"## Variant A (descendant 1):\n"
+            f"```\n{parent_a.text}\n```\n\n"
+            f"## Variant B (descendant 2):\n"
+            f"```\n{parent_b.text}\n```\n\n"
+            f"Both Variant A and Variant B were derived from the ancestor and each\n"
+            f"improved on different aspects of the task (as evidenced by their\n"
+            f"validation performance). Your goal is to FUSE their complementary\n"
+            f"strengths into a single new instruction.\n\n"
+            f"---\n"
+            f"## Execution traces and failures for Variant A:\n"
+            f"```\n{diag_a}\n```\n"
+            f"Error pattern summary for A:\n{err_a}\n\n"
+            f"---\n"
+            f"## Execution traces and failures for Variant B:\n"
+            f"```\n{diag_b}\n```\n"
+            f"Error pattern summary for B:\n{err_b}\n\n"
+            f"---\n"
+            f"Your task:\n"
+            f"1. Identify which strengths of Variant A addressed failures the\n"
+            f"   ancestor had (and that Variant B still exhibits in its traces).\n"
+            f"2. Identify which strengths of Variant B addressed failures the\n"
+            f"   ancestor had (and that Variant A still exhibits in its traces).\n"
+            f"3. Combine these complementary strengths into ONE coherent, complete\n"
+            f"   instruction that is a full replacement (not a diff or patch).\n"
+            f"4. Resolve contradictions by favoring the variant whose traces show\n"
+            f"   fewer failures on that aspect.\n"
+            f"5. Keep the instruction concise and reusable.\n\n"
+            f"Provide the new instruction within ``` blocks.\n"
+            f"Do NOT include explanations or meta-commentary — only the instruction."
+        )
+        sys = ("You are an expert prompt engineer. Fuse the complementary "
+               "strengths of two instruction variants into one complete "
+               "replacement. Return ONLY the new instruction text.")
+        return self._call_llm(system=sys, user=merge_prompt)
+
     # ---- 阶段二：单题动态归纳 ----
     def extract_pattern_from_question(self, question: str) -> Example:
         """对未命中的测试问题临时归纳一条短期规律（动态学习机制）。"""

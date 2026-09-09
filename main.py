@@ -93,6 +93,11 @@ def _save_outputs(
                 "new_minibatch": h.get("new_minibatch"),
                 "new_val_score": h.get("new_val_score"),
                 "budget_used": h.get("budget_used"),
+                # merge-only fields (None unless evo_mode=gepa-merge)
+                "merged_entities": h.get("merged_entities"),
+                "merge_accepted": (h.get("accepted")
+                                   if h.get("evo_mode") == "gepa-merge" else None),
+                "merge_total_tested": h.get("merge_total_tested"),
             }
             for h in history
         ],
@@ -137,6 +142,7 @@ def run_dataset(
     dataset: str, n_train: int, n_val: int, n_iters: int,
     seed: int, dynamic_learning: bool, output_dir: str | None,
     evo_mode: str, train_retrieve_ctx: bool, test_use_patterns: bool,
+    use_merge: bool = True, max_merge_invocations: int = 10,
 ) -> None:
     """Load a real dataset and run the two-phase loop, then save outputs.
 
@@ -159,6 +165,7 @@ def run_dataset(
         evo_mode=evo_mode, train_retrieve_ctx=train_retrieve_ctx,
         max_metric_calls=cfg.max_metric_calls, minibatch_size=cfg.minibatch_size,
         max_prompt_length=cfg.max_prompt_length, seed=seed,
+        use_merge=use_merge, max_merge_invocations=max_merge_invocations,
     )
     engine.set_dataset(dataset)   # inject the matching grader
 
@@ -195,6 +202,7 @@ def run_dataset(
         "seed": seed, "dynamic_learning": dynamic_learning,
         "test_use_patterns": test_use_patterns,
         "evo_mode": evo_mode, "train_retrieve_ctx": train_retrieve_ctx,
+        "use_merge": use_merge, "max_merge_invocations": max_merge_invocations,
     }
     if output_dir is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -238,6 +246,14 @@ def main() -> None:
     parser.add_argument("--no-train-ctx", dest="train_retrieve_ctx",
                         action="store_false",
                         help="disable KB retrieval during training")
+    parser.add_argument("--use-merge", action="store_true",
+                        default=cfg.use_merge,
+                        help="enable the merge operator in GEPA mode (default from .env)")
+    parser.add_argument("--no-merge", dest="use_merge", action="store_false",
+                        help="disable the merge operator in GEPA mode")
+    parser.add_argument("--max-merge-invocations", type=int,
+                        default=cfg.max_merge_invocations,
+                        help=f"max merge attempts in GEPA mode (default from .env: {cfg.max_merge_invocations})")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="output directory (default: sro_output_<dataset>_<timestamp>)")
     args = parser.parse_args()
@@ -247,7 +263,8 @@ def main() -> None:
     elif args.dataset:
         run_dataset(args.dataset, args.n_train, args.n_val, args.n_iters,
                     args.seed, args.dynamic_learning, args.output_dir,
-                    args.evo_mode, args.train_retrieve_ctx, args.test_use_patterns)
+                    args.evo_mode, args.train_retrieve_ctx, args.test_use_patterns,
+                    args.use_merge, args.max_merge_invocations)
     else:
         parser.print_help()
 

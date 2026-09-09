@@ -47,6 +47,9 @@ DEFAULTS = {
     "MAX_METRIC_CALLS": "150",
     "MINIBATCH_SIZE": "8",
     "MAX_PROMPT_LENGTH": "2000",
+    # ---- merge 算子（GEPA crossover 适配）----
+    "USE_MERGE": "true",
+    "MAX_MERGE_INVOCATIONS": "10",
     # ---- 检索 / 匹配 ----
     "EMBED_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
     "EMBED_DIM": "384",
@@ -94,6 +97,9 @@ class Config:
     max_metric_calls: int
     minibatch_size: int
     max_prompt_length: int
+    # merge 算子（Config.load() 显式传值，无需默认值，避免 dataclass 字段顺序冲突）
+    use_merge: bool
+    max_merge_invocations: int
     embed_model: str
     embed_dim: int
     match_threshold: float
@@ -139,6 +145,8 @@ class Config:
             max_metric_calls=int(g("MAX_METRIC_CALLS")),
             minibatch_size=int(g("MINIBATCH_SIZE")),
             max_prompt_length=int(g("MAX_PROMPT_LENGTH")),
+            use_merge=_parse_bool(g("USE_MERGE")),
+            max_merge_invocations=int(g("MAX_MERGE_INVOCATIONS")),
             embed_model=g("EMBED_MODEL"),
             embed_dim=int(g("EMBED_DIM")),
             match_threshold=float(g("MATCH_THRESHOLD")),

@@ -60,6 +60,8 @@ class SROEngine:
         minibatch_size: int = 8,
         max_prompt_length: int = 2000,
         seed: int = 42,
+        use_merge: bool = True,
+        max_merge_invocations: int = 10,
     ) -> None:
         self.embedder = embedder or Embedder()
         self.task_lm = task_lm or TaskLM(self.embedder)
@@ -75,6 +77,13 @@ class SROEngine:
         self.minibatch_size = minibatch_size
         self.max_prompt_length = max_prompt_length
         self.seed = seed
+        self.use_merge = use_merge
+        self.max_merge_invocations = max_merge_invocations
+        # merge 调度状态（对齐 GEPA MergeProposer）
+        self._merges_due = 0
+        self._total_merges_tested = 0
+        self._last_iter_found_new_program = False
+        self._merges_performed: list[tuple[int, int, int]] = []
 
     def set_dataset(self, dataset: str) -> None:
         """绑定数据集：把对应 evaluate_answer 注入 TaskLM.judger，
@@ -255,6 +264,236 @@ class SROEngine:
         return scores
 
     # -------------------------------------------------------------------
+    # merge 算子辅助方法（适配自 gepa/proposer/merge.py）
+    # -------------------------------------------------------------------
+
+    def _find_common_ancestor(
+        self, candidates: list[Strategy], rng, max_attempts: int = 10,
+    ) -> Optional[tuple[int, int, int]]:
+        """从候选池找 (idx_a, idx_b, ancestor_idx) 三元组用于 merge。
+
+        适配 GEPA find_common_ancestor_pair + filter_ancestors +
+        does_triplet_have_desirable_predictors。SRO 单亲树（parent_idx
+        单 int），祖先走 while 循环而非递归；无命名组件，"有可合并物"
+        的检查退化为文本差异检查。
+        """
+        n = len(candidates)
+        if n < 3:
+            return None
+
+        def _ancestors_of(idx: int) -> set:
+            """走 parent_idx 链收集祖先集（SRO 单亲树）。"""
+            seen: set[int] = set()
+            cur = candidates[idx].parent_idx
+            while cur is not None and cur not in seen:
+                seen.add(cur)
+                cur = candidates[cur].parent_idx
+            return seen
+
+        for _ in range(max_attempts):
+            if n < 2:
+                return None
+            i, j = rng.sample(range(n), 2)
+            if j < i:
+                i, j = j, i
+
+            anc_i = _ancestors_of(i)
+            anc_j = _ancestors_of(j)
+            # 互不为祖先后代
+            if j in anc_i or i in anc_j:
+                continue
+
+            common = anc_i & anc_j
+            valid = []
+            for a in common:
+                # 跳过已 merge 的三元组
+                if (i, j, a) in self._merges_performed:
+                    continue
+                # 祖先分数不能高于任一后代
+                if (candidates[a].score > candidates[i].score
+                        or candidates[a].score > candidates[j].score):
+                    continue
+                # 单文本"有可合并物"检查：至少一方相对祖先进化了
+                if (candidates[i].text != candidates[a].text
+                        or candidates[j].text != candidates[a].text):
+                    valid.append(a)
+            if not valid:
+                continue
+            # 按 ancestor 分数加权采样
+            weights = [candidates[a].score + 1e-9 for a in valid]
+            ancestor = rng.choices(valid, weights=weights, k=1)[0]
+            return (i, j, ancestor)
+        return None
+
+    @staticmethod
+    def _select_eval_subsample(
+        scores_a: list[float], scores_b: list[float], rng,
+        num_subsample_ids: int = 5,
+    ) -> list[int]:
+        """分层采样 val 子集用于 merge 评估。
+
+        忠实移植 GEPA select_eval_subsample_for_merged_program：按
+        a 更好 / b 更好 / 平 三组各采 ~1/3，补足从剩余随机。
+        """
+        import math
+        all_indices = set(range(len(scores_a)))
+        p1 = [i for i, (s1, s2) in enumerate(zip(scores_a, scores_b))
+              if s1 > s2]
+        p2 = [i for i, (s1, s2) in enumerate(zip(scores_a, scores_b))
+              if s2 > s1]
+        p3 = [i for i in all_indices if i not in p1 and i not in p2]
+
+        n_each = math.ceil(num_subsample_ids / 3)
+        n1 = min(len(p1), n_each)
+        n2 = min(len(p2), n_each)
+        n3 = min(len(p3), num_subsample_ids - (n1 + n2))
+        selected: list[int] = []
+        if n1:
+            selected += rng.sample(p1, k=n1)
+        if n2:
+            selected += rng.sample(p2, k=n2)
+        if n3:
+            selected += rng.sample(p3, k=n3)
+
+        remaining = num_subsample_ids - len(selected)
+        unused = list(all_indices - set(selected))
+        if remaining > 0:
+            if len(unused) >= remaining:
+                selected += rng.sample(unused, k=remaining)
+            else:
+                selected += rng.choices(list(all_indices), k=remaining)
+        return selected[:num_subsample_ids]
+
+    def _eval_candidate_on_subsample(
+        self, text: str, minibatch: list[TrainSample],
+    ) -> list[float]:
+        """在子采样上评估策略文本，返回 per-sample 1.0/0.0。
+
+        _eval_candidate 的裁剪版：建临时 Strategy，跑子采样（无 KB
+        context，与 _eval_candidate 一致），恢复。
+        """
+        from .llm import Strategy as _S
+        original = self.task_lm.strategy
+        self.task_lm.update_strategy(_S(text=text, version=-1))
+        scores: list[float] = []
+        for sample in minibatch:
+            trace = self.task_lm.run(
+                sample.problem,
+                context_examples=[],
+                gold_answer=sample.answer,
+                answer_type=sample.answer_type,
+            )
+            scores.append(1.0 if trace.result.correct else 0.0)
+        self.task_lm.update_strategy(original)
+        return scores
+
+    def _attempt_merge(
+        self, candidates: list[Strategy], val_for_pareto: list[TrainSample],
+        n_val: int, budget_used: int, rng, verbose: bool, iteration: int,
+    ) -> tuple[Optional[Strategy], int, dict]:
+        """尝试一次 merge（GEPA MergeProposer.propose 内联）。
+
+        返回 (新策略或None, 更新后的budget, 记录dict)。
+        调用方负责 append 到 candidates + 重算 Pareto。
+        """
+        triplet = self._find_common_ancestor(candidates, rng)
+        if triplet is None:
+            return (None, budget_used, {"attempted": False, "reason": "no_triplet"})
+
+        idx_a, idx_b, anc_idx = triplet
+        self._merges_performed.append((idx_a, idx_b, anc_idx))
+        self._total_merges_tested += 1
+
+        parent_a = candidates[idx_a]
+        parent_b = candidates[idx_b]
+        ancestor = candidates[anc_idx]
+
+        # 子采样选择（基于两父本的 val_scores）
+        subsample_ids = self._select_eval_subsample(
+            parent_a.val_scores, parent_b.val_scores, rng)
+        minibatch = [val_for_pareto[k] for k in subsample_ids]
+
+        # 父本各自在子采样上的分数（从 val_scores 取，无需重跑）
+        parent_a_sub = [parent_a.val_scores[k] for k in subsample_ids]
+        parent_b_sub = [parent_b.val_scores[k] for k in subsample_ids]
+        parent_a_sum = sum(parent_a_sub)
+        parent_b_sum = sum(parent_b_sub)
+
+        # 父本跑子采样取 traces（为 merge_strategies 提供诊断）
+        traces_a = self._run_minibatch(parent_a, minibatch)
+        traces_b = self._run_minibatch(parent_b, minibatch)
+        budget_used += 2 * len(subsample_ids)
+
+        # LLM 融合
+        merged_text = self.reflection_lm.merge_strategies(
+            ancestor, parent_a, parent_b, traces_a, traces_b, iteration)
+        merged_text = _clean_markdown(merged_text)
+        if not merged_text or merged_text == parent_a.text or merged_text == parent_b.text:
+            return (None, budget_used, {
+                "attempted": True, "accepted": False,
+                "reason": "empty_or_identical",
+                "merged_entities": (idx_a, idx_b, anc_idx),
+                "subsample_ids": subsample_ids,
+                "parent_a_subsample_sum": parent_a_sum,
+                "parent_b_subsample_sum": parent_b_sum,
+            })
+        if len(merged_text) > self.max_prompt_length:
+            return (None, budget_used, {
+                "attempted": True, "accepted": False,
+                "reason": f"too_long({len(merged_text)})",
+                "merged_entities": (idx_a, idx_b, anc_idx),
+                "subsample_ids": subsample_ids,
+                "parent_a_subsample_sum": parent_a_sum,
+                "parent_b_subsample_sum": parent_b_sum,
+            })
+
+        # 子采样评估融合产物
+        merged_sub_scores = self._eval_candidate_on_subsample(
+            merged_text, minibatch)
+        budget_used += len(subsample_ids)
+        merged_sum = sum(merged_sub_scores)
+
+        record = {
+            "attempted": True, "accepted": False,
+            "merged_entities": (idx_a, idx_b, anc_idx),
+            "subsample_ids": subsample_ids,
+            "parent_a_subsample_scores": parent_a_sub,
+            "parent_b_subsample_scores": parent_b_sub,
+            "merged_subsample_scores": merged_sub_scores,
+            "parent_a_subsample_sum": parent_a_sum,
+            "parent_b_subsample_sum": parent_b_sum,
+            "merged_subsample_sum": merged_sum,
+            "threshold": max(parent_a_sum, parent_b_sum),
+            "merge_total_tested": self._total_merges_tested,
+        }
+
+        # 接受准则：>= max(parent_sums)（非 strict，忠实 GEPA）
+        if merged_sum < max(parent_a_sum, parent_b_sum):
+            record["reason"] = (f"no_improvement({merged_sum}"
+                                f" < {max(parent_a_sum, parent_b_sum)})")
+            if verbose:
+                print(f"[Merge-Reject] subsample {merged_sum}"
+                      f" < max({parent_a_sum},{parent_b_sum})")
+            return (None, budget_used, record)
+
+        # 接受：全 val eval
+        merged_strat = Strategy(
+            text=merged_text, version=len(candidates), parent_idx=idx_a)
+        merged_strat.val_scores = self._eval_candidate(
+            merged_strat, val_for_pareto)
+        budget_used += n_val
+        merged_strat.score = sum(merged_strat.val_scores) / n_val
+        # sidecar：第二父本 + 祖先（不改 dataclass）
+        merged_strat._merge_meta = {"parent_b_idx": idx_b, "ancestor_idx": anc_idx}
+
+        record["accepted"] = True
+        if verbose:
+            print(f"[Merge-Accept] #{len(candidates)} via"
+                  f" ({idx_a},{idx_b},anc={anc_idx})"
+                  f" sub={merged_sum} val={merged_strat.score:.2%}")
+        return (merged_strat, budget_used, record)
+
+    # -------------------------------------------------------------------
     # GEPA 核心训练循环
     # -------------------------------------------------------------------
 
@@ -303,6 +542,39 @@ class SROEngine:
             if verbose:
                 print(f"\n=== GEPA iteration {iteration}"
                       f" (budget {budget_used}/{self.max_metric_calls}) ===")
+
+            # ===== Merge attempt (before reflective, 对齐 GEPA) =====
+            merge_record = None
+            if (self.use_merge and self._merges_due > 0
+                    and self._last_iter_found_new_program
+                    and self._total_merges_tested < self.max_merge_invocations
+                    and budget_used < self.max_metric_calls):
+                merged_strat, budget_used, merge_record = self._attempt_merge(
+                    candidates, val_for_pareto, n_val,
+                    budget_used, rng, verbose, iteration)
+                if merged_strat is not None:
+                    # 接受：消费 slot，入池，重算 Pareto，跳过 reflective
+                    self._merges_due = max(0, self._merges_due - 1)
+                    candidates.append(merged_strat)
+                    pareto_fronts = build_pareto_fronts(
+                        [c.val_scores for c in candidates], n_val)
+                    if merged_strat.score > best_score:
+                        best_idx = len(candidates) - 1
+                        best_score = merged_strat.score
+                    merge_record.update({
+                        "iteration": iteration, "evo_mode": "gepa-merge",
+                        "budget_used": budget_used,
+                        "new_val_score": merged_strat.score,
+                        "strategy_version": merged_strat.version,
+                        "strategy_text": merged_strat.text,
+                    })
+                    history.append(merge_record)
+                    self._last_iter_found_new_program = True
+                    continue
+                else:
+                    # 拒绝：不消费 merges_due（对齐 GEPA），落到 reflective
+                    pass
+            self._last_iter_found_new_program = False  # reset；reflective 接受时再设 True
 
             try:
                 # 2a) Pareto select parent
@@ -382,6 +654,12 @@ class SROEngine:
                     old_traces + new_traces)
                 self.kb.add_patterns(patterns)
 
+                # 调度下一轮 merge（对齐 GEPA schedule_if_needed）
+                if (self.use_merge
+                        and self._total_merges_tested < self.max_merge_invocations):
+                    self._merges_due += 1
+                self._last_iter_found_new_program = True
+
                 history.append({
                     "iteration": iteration, "evo_mode": "gepa",
                     "parent_idx": parent_idx,
@@ -390,6 +668,8 @@ class SROEngine:
                     "accepted": True, "budget_used": budget_used,
                     "strategy_version": new_strat.version,
                     "strategy_text": new_strat.text,
+                    "merge_attempted_this_iter": merge_record is not None,
+                    "merge_record": merge_record,
                 })
 
             except Exception as e:
