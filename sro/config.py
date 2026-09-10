@@ -50,6 +50,9 @@ DEFAULTS = {
     # ---- merge 算子（GEPA crossover 适配）----
     "USE_MERGE": "true",
     "MAX_MERGE_INVOCATIONS": "10",
+    # ---- API 重试（服务端临时故障自动重试）----
+    "MAX_RETRIES": "3",           # 0=不重试；可重试错误（5xx/连接/限流/超时）的最大重试次数
+    "RETRY_BACKOFF_BASE": "2",    # 指数退避基数（秒），实际等待 base^attempt × (1±0.25 抖动)
     # ---- 检索 / 匹配 ----
     "EMBED_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
     "EMBED_DIM": "384",
@@ -100,6 +103,9 @@ class Config:
     # merge 算子（Config.load() 显式传值，无需默认值，避免 dataclass 字段顺序冲突）
     use_merge: bool
     max_merge_invocations: int
+    # API 重试
+    max_retries: int
+    retry_backoff_base: float
     embed_model: str
     embed_dim: int
     match_threshold: float
@@ -147,6 +153,8 @@ class Config:
             max_prompt_length=int(g("MAX_PROMPT_LENGTH")),
             use_merge=_parse_bool(g("USE_MERGE")),
             max_merge_invocations=int(g("MAX_MERGE_INVOCATIONS")),
+            max_retries=int(g("MAX_RETRIES")),
+            retry_backoff_base=float(g("RETRY_BACKOFF_BASE")),
             embed_model=g("EMBED_MODEL"),
             embed_dim=int(g("EMBED_DIM")),
             match_threshold=float(g("MATCH_THRESHOLD")),

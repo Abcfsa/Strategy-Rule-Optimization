@@ -109,6 +109,8 @@ class _OpenAIClient:
         self.is_real = False
         cfg = get_config()
         self._cfg = cfg
+        self._max_retries = cfg.max_retries
+        self._retry_backoff_base = cfg.retry_backoff_base
         if not cfg.has_api_key:
             return
         try:
@@ -237,6 +239,44 @@ class _OpenAIClient:
         # 某些模型把全部输出放在 reasoning_content，回退保证有东西可抽答案
         return "".join(reasoning_parts)
 
+    @staticmethod
+    def _is_retryable(err: Exception) -> bool:
+        """是否值得重试：服务端临时故障（5xx）/ 连接错误 / 限流 / 超时。
+
+        4xx 客户端错误（请求本身有问题）不重试。openai 库异常类的名称
+        按版本可能有差异，用字符串匹配做兼容。
+        """
+        import re
+        name = type(err).__name__
+        msg = str(err)
+        # 明确不可重试的 4xx 客户端错误
+        no_retry = ("BadRequest", "Authentication", "NotFound", "Permission",
+                    "Unprocessable", "Conflict")
+        if any(n in name for n in no_retry):
+            return False
+        # 可重试：服务端 5xx / 连接 / 限流 / 超时
+        yes_retry = ("APIError", "APIConnectionError", "APITimeoutError",
+                    "RateLimitError", "Timeout", "InternalServer",
+                    "InternalServerError")
+        if any(n in name for n in yes_retry):
+            return True
+        # 兜底：状态码 5xx 或 429 限流
+        code = getattr(err, "status_code", None) or getattr(err, "code", None)
+        if isinstance(code, int) and (500 <= code < 600 or code == 429):
+            return True
+        # 消息含 internal/timeout/timed out/overloaded/try again/temporar
+        if re.search(r"(internal|timeout|timed out|overloaded|try again|temporar)",
+                     msg, re.IGNORECASE):
+            return True
+        return False
+
+    def _backoff(self, attempt: int) -> float:
+        """指数退避 + ±25% 抖动：attempt 从 1 开始。"""
+        import random as _r
+        base = self._retry_backoff_base ** attempt
+        jitter = 1.0 + _r.uniform(-0.25, 0.25)
+        return base * jitter
+
     def chat(self, model: str, system: str, user: str, *,
              timeout: Optional[float] = None,
              temperature: float = 0.0, max_tokens: int = 4096,
@@ -246,7 +286,12 @@ class _OpenAIClient:
 
         开启 thinking 的模型族走流式（端点硬性要求），聚合 delta.content；
         否则非流式（现状路径不变）。
+
+        可重试错误（5xx / 连接 / 限流 / 超时）自动指数退避重试，
+        最多 self._max_retries 次；不可重试错误（4xx 客户端错误）直接抛。
+        流式路径中若后端中断，丢弃已消费 chunk 整体重发（LLM 生成无法断点续传）。
         """
+        import time as _time
         if not self.is_real:
             return f"[TaskLM placeholder reply] system={system[:40]!r} user={user[:40]!r}"
         kwargs = self.build_api_kwargs(
@@ -256,14 +301,30 @@ class _OpenAIClient:
         )
         messages = [{"role": "system", "content": system},
                     {"role": "user", "content": user}]
-        if self._needs_stream(kwargs):
-            kwargs["stream"] = True
-            stream = self._client.chat.completions.create(
-                messages=messages, timeout=timeout, **kwargs)
-            return self._aggregate_stream(stream)
-        resp = self._client.chat.completions.create(
-            messages=messages, timeout=timeout, **kwargs)
-        return resp.choices[0].message.content or ""
+        last_err: Optional[Exception] = None
+        for attempt in range(self._max_retries + 1):  # 0=首次, 1..max=重试
+            try:
+                if self._needs_stream(kwargs):
+                    kw = dict(kwargs)
+                    kw["stream"] = True
+                    stream = self._client.chat.completions.create(
+                        messages=messages, timeout=timeout, **kw)
+                    return self._aggregate_stream(stream)
+                resp = self._client.chat.completions.create(
+                    messages=messages, timeout=timeout, **kwargs)
+                return resp.choices[0].message.content or ""
+            except Exception as e:
+                last_err = e
+                if not self._is_retryable(e):
+                    raise
+                if attempt >= self._max_retries:
+                    break  # 重试用尽，跳出抛最后错误
+                wait = self._backoff(attempt + 1)
+                print(f"  [Retry] {type(e).__name__}: {str(e)[:80]}"
+                      f" — attempt {attempt+1}/{self._max_retries}, "
+                      f"waiting {wait:.1f}s")
+                _time.sleep(wait)
+        raise last_err  # pragma: no cover  — 重试用尽
 
     def embed(self, model: str, text: str) -> list[float]:
         """返回 embedding 向量。is_real=False 时回退占位伪向量。"""
