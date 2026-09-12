@@ -204,18 +204,14 @@ def evaluate_gsm8k(prediction: str, ground_truth: str) -> bool:
 
 
 def _clean_aime_answer(s: str) -> str:
-    """清理 AIME 答案：去除 $、\\boxed{}、逗号等包装，返回纯数字串。
-
-    用 re.search 而非 re.match，确保 ### 前缀（GEPA 答案格式）下的数字
-    也能被抽到——re.match 只从串首匹配，遇到 '### 468' 会失败。
-    """
+    """清理 AIME 答案：去除 $、\\boxed{}、逗号等包装，返回纯数字串。"""
     s = s.strip().strip('$').strip()
     boxed = re.search(r'\\boxed\{([^{}]*)\}', s)
     if boxed:
         s = boxed.group(1).strip()
     s = s.strip("[]'\"").strip()
     s = s.replace(",", "").replace(" ", "")
-    m = re.search(r'-?\d+', s)
+    m = re.match(r'-?\d+', s)
     return m.group(0) if m else s
 
 
