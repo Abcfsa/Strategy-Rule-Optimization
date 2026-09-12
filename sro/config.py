@@ -47,6 +47,9 @@ DEFAULTS = {
     "MAX_METRIC_CALLS": "150",
     "MINIBATCH_SIZE": "8",
     "MAX_PROMPT_LENGTH": "2000",
+    # ---- API 重试（服务端临时故障自动重试）----
+    "MAX_RETRIES": "3",           # 0=不重试；可重试错误（5xx/连接/限流/超时）的最大重试次数
+    "RETRY_BACKOFF_BASE": "2",    # 指数退避基数（秒），实际等待 base^attempt × (1±0.25 抖动)
     # ---- 检索 / 匹配 ----
     "EMBED_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
     "EMBED_DIM": "384",
@@ -95,6 +98,9 @@ class Config:
     max_metric_calls: int
     minibatch_size: int
     max_prompt_length: int
+    # API 重试
+    max_retries: int
+    retry_backoff_base: float
     embed_model: str
     embed_dim: int
     match_threshold: float
@@ -141,6 +147,8 @@ class Config:
             max_metric_calls=int(g("MAX_METRIC_CALLS")),
             minibatch_size=int(g("MINIBATCH_SIZE")),
             max_prompt_length=int(g("MAX_PROMPT_LENGTH")),
+            max_retries=int(g("MAX_RETRIES")),
+            retry_backoff_base=float(g("RETRY_BACKOFF_BASE")),
             embed_model=g("EMBED_MODEL"),
             embed_dim=int(g("EMBED_DIM")),
             match_threshold=float(g("MATCH_THRESHOLD")),
