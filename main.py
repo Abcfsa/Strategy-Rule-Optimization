@@ -137,7 +137,7 @@ def run_dataset(
     dataset: str, n_train: int, n_val: int, n_iters: int,
     seed: int, dynamic_learning: bool, output_dir: str | None,
     evo_mode: str, train_retrieve_ctx: bool, test_use_patterns: bool,
-    aime_gepa_split: bool = False,
+    aime_gepa_split: bool = False, pattern_gen_mode: str | None = None,
 ) -> None:
     """Load a real dataset and run the two-phase loop, then save outputs.
 
@@ -161,6 +161,7 @@ def run_dataset(
         evo_mode=evo_mode, train_retrieve_ctx=train_retrieve_ctx,
         max_metric_calls=cfg.max_metric_calls, minibatch_size=cfg.minibatch_size,
         max_prompt_length=cfg.max_prompt_length, seed=seed,
+        pattern_gen_mode=pattern_gen_mode,
     )
     engine.set_dataset(dataset, gepa_split=aime_gepa_split)   # inject the matching grader
 
@@ -198,6 +199,7 @@ def run_dataset(
         "test_use_patterns": test_use_patterns,
         "evo_mode": evo_mode, "train_retrieve_ctx": train_retrieve_ctx,
         "aime_gepa_split": aime_gepa_split,
+        "pattern_gen_mode": engine.pattern_gen_mode,
     }
     if output_dir is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -244,6 +246,10 @@ def main() -> None:
     parser.add_argument("--aime-gepa-split", action="store_true",
                         default=cfg.aime_gepa_split,
                         help="AIME only: replicate GEPA init_dataset() split (seed=0, half/half, ### answer prefix)")
+    parser.add_argument("--pattern-gen-mode", choices=["basic", "rich"],
+                        default=None,
+                        help="short-term pattern generation mode: basic=max 6 patterns/reflect (default from .env), "
+                             "rich=multi-angle extraction + error clustering (~6x more patterns, ~6x reflection cost)")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="output directory (default: sro_output_<dataset>_<timestamp>)")
     args = parser.parse_args()
@@ -254,7 +260,7 @@ def main() -> None:
         run_dataset(args.dataset, args.n_train, args.n_val, args.n_iters,
                     args.seed, args.dynamic_learning, args.output_dir,
                     args.evo_mode, args.train_retrieve_ctx, args.test_use_patterns,
-                    args.aime_gepa_split)
+                    args.aime_gepa_split, args.pattern_gen_mode)
     else:
         parser.print_help()
 

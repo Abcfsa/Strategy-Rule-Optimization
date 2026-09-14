@@ -50,6 +50,10 @@ DEFAULTS = {
     # ---- API 重试（服务端临时故障自动重试）----
     "MAX_RETRIES": "3",           # 0=不重试；可重试错误（5xx/连接/限流/超时）的最大重试次数
     "RETRY_BACKOFF_BASE": "2",    # 指数退避基数（秒），实际等待 base^attempt × (1±0.25 抖动)
+    # ---- 短期规律生成 ----
+    "PATTERN_GEN_MODE": "basic",  # basic=现状(每reflect最多6条) / rich=多角度+聚类(每reflect最多~35条)
+    "PATTERN_MAX_TRACES": "8",    # rich 模式：wrong/correct 各取的最大 trace 数
+    "PATTERN_DEDUP_THRESHOLD": "0.0",  # >0 时规律入库前与已有规律 cosine>=阈值则跳过(去重)；rich 建议 0.92
     # ---- 检索 / 匹配 ----
     "EMBED_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
     "EMBED_DIM": "384",
@@ -101,6 +105,10 @@ class Config:
     # API 重试
     max_retries: int
     retry_backoff_base: float
+    # 短期规律生成
+    pattern_gen_mode: str
+    pattern_max_traces: int
+    pattern_dedup_threshold: float
     embed_model: str
     embed_dim: int
     match_threshold: float
@@ -149,6 +157,9 @@ class Config:
             max_prompt_length=int(g("MAX_PROMPT_LENGTH")),
             max_retries=int(g("MAX_RETRIES")),
             retry_backoff_base=float(g("RETRY_BACKOFF_BASE")),
+            pattern_gen_mode=g("PATTERN_GEN_MODE"),
+            pattern_max_traces=int(g("PATTERN_MAX_TRACES")),
+            pattern_dedup_threshold=float(g("PATTERN_DEDUP_THRESHOLD")),
             embed_model=g("EMBED_MODEL"),
             embed_dim=int(g("EMBED_DIM")),
             match_threshold=float(g("MATCH_THRESHOLD")),

@@ -492,7 +492,8 @@ class TaskLM:
         ctx = {"strategy_version": self.strategy.version,
                "n_examples": len(context_examples or []),
                "examples_text": few_shot,
-               "answer_type": answer_type}
+               "answer_type": answer_type,
+               "gold_answer": gold_answer or ""}
         raw = self._call_llm(system_prompt, problem)
         answer, correct = self._parse_output(raw, gold_answer, answer_type)
         return Trace(problem=problem, trajectory=raw,
@@ -672,7 +673,8 @@ class ReflectionLM:
                  对单个未命中问题临时归纳一条短期规律。
     """
 
-    def __init__(self, embedder: Optional[Embedder] = None) -> None:
+    def __init__(self, embedder: Optional[Embedder] = None,
+                 pattern_gen_mode: Optional[str] = None) -> None:
         cfg = get_config()
         self.model = cfg.reflection_model
         self.timeout = cfg.reflection_timeout
@@ -682,6 +684,13 @@ class ReflectionLM:
         self.max_context_len = cfg.reflection_max_context_len
         self.extra_params = cfg.extra_params
         self.embedder = embedder or Embedder()
+        # 短期规律生成配置（pattern_gen_mode 显式传入优先，否则读 .env）
+        self.pattern_gen_mode = (pattern_gen_mode or cfg.pattern_gen_mode).lower()
+        self.pattern_max_traces = cfg.pattern_max_traces
+        if self.pattern_gen_mode not in ("basic", "rich"):
+            raise ValueError(
+                f"unknown pattern_gen_mode {self.pattern_gen_mode!r}; "
+                f"choose 'basic' or 'rich'")
 
     def _call_llm(self, system: str, user: str) -> str:
         """真实模型调用。无 key 时回退占位。"""
@@ -764,12 +773,22 @@ class ReflectionLM:
 
     # ---- 阶段一：批量反思 ----
     def reflect(self, traces: list[Trace]) -> tuple[list[Example], Strategy]:
-        """分析一批轨迹，产出短期规律 + 长期策略。
+        """分析一批轨迹，产出短期规律 + 长期策略。按 pattern_gen_mode 分发。
+
+        basic: 每批最多 6 条（wrong[:3]+correct[:3] 各 1 角度），轨迹截 200 字符。
+        rich:  每批最多 ~35 条（wrong/correct 各至多 pattern_max_traces 条 × 2 角度
+               + 错误聚类至多 3 条），轨迹截 2000 字符。
 
         返回:
             short_patterns: 特定例子/短期规律（带 embedding）
             long_strategy:  长期策略（System Prompt 级方法论）
         """
+        if self.pattern_gen_mode == "rich":
+            return self._reflect_rich(traces)
+        return self._reflect_basic(traces)
+
+    def _reflect_basic(self, traces: list[Trace]) -> tuple[list[Example], Strategy]:
+        """basic 模式：原有逻辑，每批最多 6 条规律。"""
         correct = [t for t in traces if t.result.correct]
         wrong = [t for t in traces if not t.result.correct]
         c = _get_client()
@@ -811,6 +830,121 @@ class ReflectionLM:
                 )
                 p.embedding = self.embedder.embed(p.text)
                 patterns.append(p)
+            long_text = self._call_llm(
+                system="You are a meta-learning methodology expert. Summarize a general problem-solving strategy.",
+                user=f"Summarize the common lessons from these {len(traces)} trajectories.",
+            )
+
+        long_strategy = Strategy(text=long_text, version=1)
+        return patterns, long_strategy
+
+    def _reflect_rich(self, traces: list[Trace]) -> tuple[list[Example], Strategy]:
+        """rich 模式：多角度提取 + 错误聚类，产量约为 basic 的 6 倍。
+
+        每条 wrong trace 产 2 条规律：
+            a) 错误步骤定位（第一步错在哪 + 纠正规则），polarity=-1
+            b) 避坑教训（与 basic 同角度），polarity=-1
+        每条 correct trace 产 2 条规律：
+            a) 有效做法（与 basic 同角度），polarity=+1
+            b) 触发规则（"当题目出现特征 X 时，用技巧 Y"——以题目特征为键，
+               向量检索命中率更高），polarity=+1
+        batch 级：错误聚类规律至多 3 条，polarity=-1。
+        轨迹截断放宽到 2000 字符（basic 是 200）。
+        """
+        correct = [t for t in traces if t.result.correct]
+        wrong = [t for t in traces if not t.result.correct]
+        cap = max(1, self.pattern_max_traces)
+        c = _get_client()
+
+        patterns: list[Example] = []
+
+        def _add(text: str, run_id: str, polarity: int) -> None:
+            text = (text or "").strip()
+            if not text:
+                return
+            p = Example(text=text, source_run_id=run_id, polarity=polarity)
+            p.embedding = self.embedder.embed(text)
+            patterns.append(p)
+
+        if c.is_real:
+            # ---- a) wrong traces × 2 角度 ----
+            for t in wrong[:cap]:
+                gold = t.context.get("gold_answer", "N/A")
+                # 角度1：错误步骤定位
+                sys1 = ("You are an experience distillation assistant. Compare the model's "
+                        "reasoning with the correct answer, locate the FIRST erroneous step, "
+                        "and state a correction rule that prevents this error class "
+                        "(one or two sentences).")
+                usr1 = (f"Problem:\n{t.problem}\n"
+                        f"Model's answer: {t.result.answer}\n"
+                        f"Correct answer: {gold}\n"
+                        f"Full reasoning:\n{t.trajectory[:2000]}")
+                _add(self._call_llm(sys1, usr1), t.run_id, -1)
+                # 角度2：避坑教训（与 basic 同角度，但轨迹更长）
+                sys2 = ("You are an experience distillation assistant. Extract one reusable "
+                        "pitfall-avoidance lesson from this failed trajectory (one sentence).")
+                usr2 = (f"Problem:\n{t.problem}\nWrong answer:\n{t.result.answer}\n"
+                        f"Trajectory excerpt:\n{t.trajectory[:2000]}")
+                _add(self._call_llm(sys2, usr2), t.run_id, -1)
+
+            # ---- b) correct traces × 2 角度 ----
+            for t in correct[:cap]:
+                # 角度1：有效做法
+                sys3 = ("You are an experience distillation assistant. Extract one reusable "
+                        "effective practice from this correct trajectory (one sentence).")
+                usr3 = (f"Problem:\n{t.problem}\n"
+                        f"Trajectory excerpt:\n{t.trajectory[:2000]}")
+                _add(self._call_llm(sys3, usr3), t.run_id, +1)
+                # 角度2：触发规则（题目特征 → 技巧）
+                sys4 = ("You are an experience distillation assistant. From this correct "
+                        "trajectory, extract one TRIGGER RULE in the form: "
+                        "'When a problem has feature X, use technique Y.' "
+                        "Keep it to one sentence and make the feature X concrete "
+                        "(problem-type keywords, given conditions, or structure).")
+                usr4 = (f"Problem:\n{t.problem}\n"
+                        f"Trajectory excerpt:\n{t.trajectory[:2000]}")
+                _add(self._call_llm(sys4, usr4), t.run_id, +1)
+
+            # ---- c) batch 级错误聚类（至多 3 条）----
+            if len(wrong) >= 2:
+                digest_lines = []
+                for i, t in enumerate(wrong[:cap], 1):
+                    gold = t.context.get("gold_answer", "N/A")
+                    digest_lines.append(
+                        f"[{i}] Problem: {t.problem[:150]}\n"
+                        f"    Model answer: {t.result.answer} | Correct: {gold}")
+                digest = "\n".join(digest_lines)
+                sys5 = ("You are an error-pattern analyst. Cluster the following failed "
+                        "problems by their shared root cause, and for each cluster with "
+                        "2+ problems output one reusable lesson starting with "
+                        "'Problems involving ...'. Output at most 3 lessons, "
+                        "one per line, no numbering.")
+                cluster_text = self._call_llm(sys5, digest)
+                for line in (cluster_text or "").split("\n"):
+                    line = line.strip(" -*\t")
+                    if len(line) >= 20:  # 过滤空行/碎行
+                        _add(line, "", -1)
+                        if sum(1 for p in patterns if p.source_run_id == "") >= 3:
+                            break
+
+            # ---- 长期策略（与 basic 相同）----
+            sys6 = "You are a meta-learning methodology expert. Summarize a general problem-solving strategy."
+            usr6 = f"Summarize the common lessons from these {len(traces)} trajectories."
+            long_text = self._call_llm(sys6, usr6)
+        else:
+            # 占位逻辑（无 key）：模拟 rich 的产量结构
+            for t in wrong[:cap]:
+                _add(f"Error localization on '{t.problem[:30]}': "
+                     f"got {t.result.answer[:20]}", t.run_id, -1)
+                _add(f"Common mistake on problems like '{t.problem[:20]}': "
+                     f"{t.result.answer[:30]}", t.run_id, -1)
+            for t in correct[:cap]:
+                _add(f"Effective practice: {t.trajectory[:60]}", t.run_id, +1)
+                _add(f"When a problem resembles '{t.problem[:30]}', "
+                     f"apply the approach used here", t.run_id, +1)
+            if len(wrong) >= 2:
+                _add(f"Problems involving this batch share failure mode "
+                     f"({len(wrong)} cases)", "", -1)
             long_text = self._call_llm(
                 system="You are a meta-learning methodology expert. Summarize a general problem-solving strategy.",
                 user=f"Summarize the common lessons from these {len(traces)} trajectories.",

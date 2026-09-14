@@ -20,18 +20,32 @@ class KnowledgeBase:
     线性扫描检索（数据量小阶段足够）；真实场景可换 FAISS / Chroma。
     """
 
-    def __init__(self, embedder: Optional[Embedder] = None) -> None:
+    def __init__(self, embedder: Optional[Embedder] = None,
+                 dedup_threshold: float = 0.0) -> None:
         self.embedder = embedder or Embedder()
         self.examples: list[Example] = []   # 短期规律池
         self.strategy: Strategy = Strategy(text="", version=0)  # 长期策略
+        # >0 时入库去重：与已有规律 cosine >= 阈值则跳过（rich 模式建议 0.92）
+        self.dedup_threshold = dedup_threshold
 
     # ---------------- 短期规律 ----------------
 
-    def add_pattern(self, example: Example) -> None:
-        """新增短期规律。若缺 embedding 则补齐。"""
+    def add_pattern(self, example: Example) -> bool:
+        """新增短期规律。若缺 embedding 则补齐。
+
+        dedup_threshold > 0 时，与已有规律 cosine >= 阈值则跳过入库。
+        返回 True=已入库，False=因重复被跳过。
+        """
         if example.embedding is None:
             example.embedding = self.embedder.embed(example.text)
+        if self.dedup_threshold > 0.0:
+            for e in self.examples:
+                if (e.embedding is not None
+                        and self._cosine(example.embedding, e.embedding)
+                        >= self.dedup_threshold):
+                    return False
         self.examples.append(example)
+        return True
 
     def add_patterns(self, examples: list[Example]) -> None:
         for e in examples:

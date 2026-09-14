@@ -60,11 +60,19 @@ class SROEngine:
         minibatch_size: int = 8,
         max_prompt_length: int = 2000,
         seed: int = 42,
+        pattern_gen_mode: Optional[str] = None,   # None=读 .env；basic/rich
+        pattern_dedup_threshold: Optional[float] = None,  # None=读 .env
     ) -> None:
+        from .config import get_config
+        cfg = get_config()
         self.embedder = embedder or Embedder()
         self.task_lm = task_lm or TaskLM(self.embedder)
-        self.reflection_lm = reflection_lm or ReflectionLM(self.embedder)
-        self.kb = kb or KnowledgeBase(self.embedder)
+        self.reflection_lm = reflection_lm or ReflectionLM(
+            self.embedder, pattern_gen_mode=pattern_gen_mode)
+        dedup = (cfg.pattern_dedup_threshold
+                 if pattern_dedup_threshold is None else pattern_dedup_threshold)
+        self.kb = kb or KnowledgeBase(self.embedder, dedup_threshold=dedup)
+        self.pattern_gen_mode = self.reflection_lm.pattern_gen_mode
         self.match_threshold = match_threshold
         self.top_k = top_k
         self.dynamic_learning = dynamic_learning
