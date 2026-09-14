@@ -953,6 +953,66 @@ class ReflectionLM:
         long_strategy = Strategy(text=long_text, version=1)
         return patterns, long_strategy
 
+    # ---- 测试时匹配：LLM 判断规律适用性 ----
+    def judge_pattern_matches(self, question: str,
+                              candidates: list[Example]) -> Optional[list[int]]:
+        """让 LLM 判断候选规律中哪些真正适用于该问题（retrieve-then-rerank 的 rerank 步）。
+
+        返回适用规律的下标列表（可为空 = 全不适用）；调用失败或输出解析失败
+        返回 None（调用方应回落到纯 vector 匹配）。占位模式（无 key）直接返回 None。
+        """
+        if not candidates:
+            return []
+        c = _get_client()
+        if not c.is_real:
+            return None  # 占位模式无法做 LLM 判断，让调用方回落 vector
+
+        lines = []
+        for i, e in enumerate(candidates):
+            tag = "DO" if e.polarity > 0 else "DON'T"
+            lines.append(f"[{i}] ({tag}) {e.text}")
+        listing = "\n".join(lines)
+        sys = ("You are a retrieval judge. Given a problem and a list of numbered "
+               "candidate lessons/rules, decide which candidates are genuinely "
+               "APPLICABLE to solving this problem — applicable means the lesson's "
+               "trigger condition or problem type matches this problem, not merely "
+               "similar wording. Respond with ONLY a JSON array of applicable "
+               "indices, e.g. [0,2]. Respond [] if none apply. No other text.")
+        usr = f"Problem:\n{question}\n\nCandidates:\n{listing}"
+        try:
+            raw = self._call_llm(sys, usr)
+        except Exception:
+            return None
+        return self._parse_index_array(raw, len(candidates))
+
+    @staticmethod
+    def _parse_index_array(raw: str, n_candidates: int) -> Optional[list[int]]:
+        """从 LLM 输出解析下标 JSON 数组。解析失败返回 None。"""
+        import re
+        if not raw:
+            return None
+        # 优先找 JSON 数组（容忍 markdown 代码块包裹）
+        m = re.search(r"\[[\d\s,]*\]", raw)
+        if not m:
+            return None
+        try:
+            import json as _json
+            arr = _json.loads(m.group(0))
+        except Exception:
+            return None
+        if not isinstance(arr, list):
+            return None
+        # 过滤非法下标，保序去重
+        seen: set[int] = set()
+        out: list[int] = []
+        for x in arr:
+            if isinstance(x, bool):
+                continue
+            if isinstance(x, int) and 0 <= x < n_candidates and x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+
     # ---- GEPA 反思：生成新策略 ----
     def reflect_gepa(self, parent: Strategy, minibatch_traces: list[Trace],
                      iteration: int) -> str:

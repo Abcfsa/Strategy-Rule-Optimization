@@ -62,6 +62,7 @@ class SROEngine:
         seed: int = 42,
         pattern_gen_mode: Optional[str] = None,   # None=读 .env；basic/rich
         pattern_dedup_threshold: Optional[float] = None,  # None=读 .env
+        test_match_method: Optional[str] = None,  # None=读 .env；vector/llm
     ) -> None:
         from .config import get_config
         cfg = get_config()
@@ -73,6 +74,12 @@ class SROEngine:
                  if pattern_dedup_threshold is None else pattern_dedup_threshold)
         self.kb = kb or KnowledgeBase(self.embedder, dedup_threshold=dedup)
         self.pattern_gen_mode = self.reflection_lm.pattern_gen_mode
+        self.test_match_method = (test_match_method or cfg.test_match_method).lower()
+        if self.test_match_method not in ("vector", "llm"):
+            raise ValueError(
+                f"unknown test_match_method {self.test_match_method!r}; "
+                f"choose 'vector' or 'llm'")
+        self.llm_match_recall_k = cfg.llm_match_recall_k
         self.match_threshold = match_threshold
         self.top_k = top_k
         self.dynamic_learning = dynamic_learning
@@ -426,16 +433,40 @@ class SROEngine:
     # 阶段二：测试与推理
     # ===================================================================
 
+    def _llm_match(self, question: str) -> list:
+        """LLM 匹配：向量粗召回 top-recall_k → LLM 判断适用性 → 取前 top_k 条。
+
+        失败兜底：LLM 调用失败 / 输出解析失败 / 占位模式（无 key）→
+        回落纯 vector 匹配（match_threshold），保证测试不崩。
+        LLM 判全部不适用 → 返回 []，正常走 miss 分支。
+        """
+        # 粗召回：最宽松阈值（-1.0），纯按相似度排序取 top recall_k；
+        # 适用性交给 LLM 判断，召回阶段不做质量过滤
+        candidates = self.kb.retrieve(question, k=self.llm_match_recall_k,
+                                      threshold=-1.0)
+        if not candidates:
+            return []
+        indices = self.reflection_lm.judge_pattern_matches(question, candidates)
+        if indices is None:
+            # LLM 不可用/解析失败 → 回落 vector 匹配
+            return self.kb.retrieve(question, k=self.top_k,
+                                    threshold=self.match_threshold)
+        # 按 LLM 选中下标取规律，保持粗召回的相似度序，最多 top_k 条
+        return [candidates[i] for i in indices[: self.top_k]]
+
     def inference(self, question: str, verbose: bool = False) -> tuple[str, dict]:
         """测试推理，含命中/不匹配两条分支。
 
         返回 (answer, meta)，meta 记录走了哪条分支、命中了哪些规律。
         miss 时：若 dynamic_learning 开启则走动态学习，否则直接硬答。
         """
-        # ---- 匹配机制：向量检索短期规律 ----
+        # ---- 匹配机制：按 test_match_method 分发 ----
         if self.test_use_patterns:
-            hits = self.kb.retrieve(question, k=self.top_k,
-                                    threshold=self.match_threshold)
+            if self.test_match_method == "llm":
+                hits = self._llm_match(question)
+            else:
+                hits = self.kb.retrieve(question, k=self.top_k,
+                                        threshold=self.match_threshold)
         else:
             hits = []
         hit = bool(hits)
