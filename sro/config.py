@@ -57,6 +57,7 @@ DEFAULTS = {
     # ---- 测试时匹配方法 ----
     "TEST_MATCH_METHOD": "vector",  # vector=纯cosine(现状) / llm=向量粗召回+LLM精选(retrieve-then-rerank)
     "LLM_MATCH_RECALL_K": "10",     # llm 模式：向量粗召回的候选数（LLM 从中判断哪些真正适用）
+    "MATCH_JUDGE_MODEL": "",        # llm 精选用的模型；空=继承 REFLECTION_MODEL
     # ---- 检索 / 匹配 ----
     "EMBED_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
     "EMBED_DIM": "384",
@@ -115,6 +116,7 @@ class Config:
     # 测试时匹配方法
     test_match_method: str
     llm_match_recall_k: int
+    match_judge_model: str
     embed_model: str
     embed_dim: int
     match_threshold: float
@@ -168,6 +170,7 @@ class Config:
             pattern_dedup_threshold=float(g("PATTERN_DEDUP_THRESHOLD")),
             test_match_method=g("TEST_MATCH_METHOD"),
             llm_match_recall_k=int(g("LLM_MATCH_RECALL_K")),
+            match_judge_model=g("MATCH_JUDGE_MODEL"),
             embed_model=g("EMBED_MODEL"),
             embed_dim=int(g("EMBED_DIM")),
             match_threshold=float(g("MATCH_THRESHOLD")),

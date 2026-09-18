@@ -684,6 +684,8 @@ class ReflectionLM:
         self.max_context_len = cfg.reflection_max_context_len
         self.extra_params = cfg.extra_params
         self.embedder = embedder or Embedder()
+        # llm 精选模型：空则继承 REFLECTION_MODEL（和 timeout/temperature 等参数一起复用）
+        self.judge_model = cfg.match_judge_model or self.model
         # 短期规律生成配置（pattern_gen_mode 显式传入优先，否则读 .env）
         self.pattern_gen_mode = (pattern_gen_mode or cfg.pattern_gen_mode).lower()
         self.pattern_max_traces = cfg.pattern_max_traces
@@ -692,10 +694,14 @@ class ReflectionLM:
                 f"unknown pattern_gen_mode {self.pattern_gen_mode!r}; "
                 f"choose 'basic' or 'rich'")
 
-    def _call_llm(self, system: str, user: str) -> str:
-        """真实模型调用。无 key 时回退占位。"""
+    def _call_llm(self, system: str, user: str,
+                  model: Optional[str] = None) -> str:
+        """真实模型调用。无 key 时回退占位。
+
+        model: 可选模型名覆盖（默认 self.model）。
+        """
         return _get_client().chat(
-            self.model, system, user, timeout=self.timeout,
+            model or self.model, system, user, timeout=self.timeout,
             temperature=self.temperature, max_tokens=self.max_tokens,
             enable_thinking=self.enable_thinking,
             max_context_len=self.max_context_len,
@@ -980,7 +986,7 @@ class ReflectionLM:
                "indices, e.g. [0,2]. Respond [] if none apply. No other text.")
         usr = f"Problem:\n{question}\n\nCandidates:\n{listing}"
         try:
-            raw = self._call_llm(sys, usr)
+            raw = self._call_llm(sys, usr, model=self.judge_model)
         except Exception:
             return None
         return self._parse_index_array(raw, len(candidates))
