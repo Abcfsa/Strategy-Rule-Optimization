@@ -993,12 +993,25 @@ class ReflectionLM:
             tag = "DO" if e.polarity > 0 else "DON'T"
             lines.append(f"[{i}] ({tag}) {e.text}")
         listing = "\n".join(lines)
-        sys = ("You are a retrieval judge. Given a problem and a list of numbered "
-               "candidate lessons/rules, decide which candidates are genuinely "
-               "APPLICABLE to solving this problem — applicable means the lesson's "
-               "trigger condition or problem type matches this problem, not merely "
-               "similar wording. Respond with ONLY a JSON array of applicable "
-               "indices, e.g. [0,2]. Respond [] if none apply. No other text.")
+        sys = (
+            "You are a strict retrieval judge. Given a problem and a list of "
+            "numbered candidate lessons/rules, decide which candidates are "
+            "genuinely APPLICABLE to solving this problem.\n\n"
+            "Rules:\n"
+            "1. A lesson is applicable ONLY IF its stated trigger condition or "
+            "problem type demonstrably holds for THIS problem. Surface-level "
+            "topic or wording similarity is NOT enough.\n"
+            "2. Asymmetric cost: wrongly including a misleading lesson is much "
+            "worse than wrongly excluding a helpful one. When in doubt, EXCLUDE. "
+            "Returning [] is a normal and often correct answer.\n"
+            "3. For DON'T lessons, ask instead: is this problem at concrete risk "
+            "of that specific failure mode? If the failure mode is irrelevant to "
+            "this problem, exclude it — an irrelevant warning is pure "
+            "distraction.\n"
+            "4. Judge each candidate independently; do not feel obliged to "
+            "select any.\n\n"
+            "Respond with ONLY a JSON array of applicable indices, e.g. [0,2], "
+            "or []. No other text.")
         usr = f"Problem:\n{question}\n\nCandidates:\n{listing}"
         try:
             raw = self._call_llm(sys, usr, model=self.judge_model)
