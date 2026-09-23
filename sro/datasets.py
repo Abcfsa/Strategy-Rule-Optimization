@@ -183,14 +183,58 @@ _LOADERS = {
 }
 
 
+def load_mixed(name: str, n_train: int = 50, n_val: int = 30,
+               seed: int = 42) -> tuple:
+    """加载混合数据集（"a+b" 形式），返回 (train, val)。
+
+    各数据集独立调用 load() 划分（先分后混，保证各集内部 val 不与自己的
+    train 泄漏），n_train/n_val 均分给各数据集，样本打 dataset 标签，
+    最后合并 shuffle（同 seed）。
+    """
+    names = [n.strip() for n in name.split("+") if n.strip()]
+    if len(names) < 2:
+        raise ValueError(f"mixed dataset needs >=2 names: {name!r}")
+    unknown = [n for n in names if n not in _LOADERS]
+    if unknown:
+        raise ValueError(
+            f"unknown dataset(s) {unknown}; choose from {list(_LOADERS)}")
+    # AIME 不参与混合：gepa_split 是其专属逻辑，且 ### 前缀与通用判分冲突
+    if "aime" in names:
+        raise ValueError("aime does not support mixed mode (gepa_split/### prefix)")
+    # 均分（有余数时前面的数据集多分 1 条，保证总量贴近请求）
+    k = len(names)
+    tr = [n_train // k + (1 if i < n_train % k else 0) for i in range(k)]
+    vl = [n_val // k + (1 if i < n_val % k else 0) for i in range(k)]
+    trains, vals = [], []
+    for nm, nt, nv in zip(names, tr, vl):
+        # 各数据集用独立 seed 派生（避免同 seed 下各集打乱顺序耦合）
+        sub_seed = seed + (hash(nm) % 10000)
+        t, v = _LOADERS[nm](nt, nv, sub_seed)
+        for s in t:
+            s.dataset = nm
+        for s in v:
+            s.dataset = nm
+        trains.extend(t)
+        vals.extend(v)
+        print(f"  [mixed] {nm}: train {len(t)} | val {len(v)}")
+    random.Random(seed).shuffle(trains)
+    random.Random(seed + 1).shuffle(vals)
+    return trains, vals
+
+
 def load(dataset: str, n_train: int = 50, n_val: int = 30, seed: int = 42,
          gepa_split: bool = False):
     """加载指定数据集，返回 (train, val): tuple[list[TrainSample], list[TrainSample]]。
 
-    dataset: gsm8k / math / aime / hotpotqa
+    dataset: gsm8k / math / aime / hotpotqa，或混合 "a+b"（如 gsm8k+hotpotqa；
+    不支持 aime 混合，n_train/n_val 均分给各数据集）
 
     gepa_split: 仅 aime 生效，完全复刻 GEPA init_dataset() 划分（seed=0 + 对半切 + ### 前缀）。
     """
+    if "+" in dataset:
+        if gepa_split:
+            raise ValueError("AIME_GEPA_SPLIT is incompatible with mixed datasets")
+        return load_mixed(dataset, n_train, n_val, seed)
     if dataset not in _LOADERS:
         raise ValueError(f"unknown dataset '{dataset}'; choose from {list(_LOADERS)}")
     if dataset == "aime":

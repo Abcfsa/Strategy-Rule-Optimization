@@ -69,6 +69,16 @@ def _save_outputs(
 
     # summary.json — high-level training + val results (uses actual run params)
     val_correct = sum(1 for r in val_results if r["correct"])
+    # per-dataset accuracy buckets (mixed-dataset runs; {} for single dataset)
+    per_ds: dict[str, dict] = {}
+    for r in val_results:
+        ds = r.get("dataset", "")
+        if ds:
+            b = per_ds.setdefault(ds, {"correct": 0, "total": 0})
+            b["total"] += 1
+            b["correct"] += 1 if r["correct"] else 0
+    for b in per_ds.values():
+        b["accuracy"] = b["correct"] / b["total"] if b["total"] else 0.0
     summary = {
         "dataset": dataset,
         "evo_mode": run_params["evo_mode"],
@@ -99,6 +109,7 @@ def _save_outputs(
         "val_correct": val_correct,
         "val_total": len(val_results),
         "val_accuracy": (val_correct / len(val_results) if val_results else 0.0),
+        "per_dataset_accuracy": per_ds,   # {} for single-dataset runs
     }
     (out_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -178,12 +189,15 @@ def run_dataset(
     val_results: list[dict] = []
     correct = 0
     for i, sample in enumerate(val, 1):
-        answer, meta = engine.inference(sample.problem, verbose=False)
-        # grade with the injected judger (consistent with training)
-        ok = engine.task_lm.judger(answer, sample.answer) if engine.task_lm.judger else False
+        # sample passed through for mixed-mode per-sample judger/format dispatch
+        answer, meta = engine.inference(sample.problem, verbose=False,
+                                        sample=sample)
+        # unified grading entry: mixed -> per-sample judger; single -> injected
+        ok = engine.grade(sample, answer)
         correct += ok
         tag = "OK" if ok else "X"
-        print(f"  [{i}/{len(val)}] {tag} | branch={meta['branch']}"
+        ds_tag = f" | ds={sample.dataset}" if sample.dataset else ""
+        print(f"  [{i}/{len(val)}] {tag} | branch={meta['branch']}{ds_tag}"
               f" | pred={answer[:40]!r} | gold={sample.answer[:40]!r}")
         val_results.append({
             "index": i,
@@ -192,11 +206,24 @@ def run_dataset(
             "gold": sample.answer,
             "correct": bool(ok),
             "branch": meta["branch"],
+            "dataset": sample.dataset,   # "" for single-dataset runs
             "dynamic_added": meta.get("dynamic_added", False),
             "matched_examples": meta.get("matched_examples", []),
             "raw": meta.get("raw", ""),
         })
     print(f"\nval accuracy: {correct}/{len(val)} = {correct / len(val):.2%}")
+
+    # per-dataset bucketed accuracy (the core readout for mixed-dataset runs;
+    # single-dataset runs yield one bucket or none)
+    buckets: dict[str, list[bool]] = {}
+    for r in val_results:
+        if r["dataset"]:
+            buckets.setdefault(r["dataset"], []).append(r["correct"])
+    if buckets:
+        print("per-dataset accuracy:")
+        for ds, flags in sorted(buckets.items()):
+            print(f"  {ds}: {sum(flags)}/{len(flags)}"
+                  f" = {sum(flags) / len(flags):.2%}")
 
     # ---- save outputs ----
     run_params = {
@@ -210,11 +237,41 @@ def run_dataset(
         "reflect_wrong_only": engine.reflect_wrong_only,
         "regularized_verify": engine.regularized_verify,
         "npo_window": engine.npo_window,
+        "mixed_datasets": engine.mixed_names,   # [] for single-dataset runs
     }
     if output_dir is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = f"sro_output_{dataset}_{ts}"
     _save_outputs(Path(output_dir), dataset, cfg, run_params, history, val_results, engine)
+
+
+_VALID_DATASETS = ["gsm8k", "math", "aime", "hotpotqa"]
+
+
+def _validate_dataset(name: str) -> str:
+    """Accept a single dataset name or a mixed 'a+b' combination.
+
+    Mixed mode: 2+ known datasets joined by '+'; aime is not allowed in
+    mixed mode (gepa_split / '###' prefix are aime-specific).
+    """
+    if "+" in name:
+        parts = [p.strip() for p in name.split("+") if p.strip()]
+        if len(parts) < 2:
+            raise argparse.ArgumentTypeError(
+                f"mixed dataset needs >=2 names: {name!r}")
+        bad = [p for p in parts if p not in _VALID_DATASETS]
+        if bad:
+            raise argparse.ArgumentTypeError(
+                f"unknown dataset(s) {bad}; choose from {_VALID_DATASETS}")
+        if "aime" in parts:
+            raise argparse.ArgumentTypeError(
+                "aime does not support mixed mode (gepa_split/### prefix)")
+        return "+".join(parts)
+    if name not in _VALID_DATASETS:
+        raise argparse.ArgumentTypeError(
+            f"unknown dataset {name!r}; choose from {_VALID_DATASETS}"
+            f" or a mixed 'a+b' combination")
+    return name
 
 
 def main() -> None:
@@ -223,8 +280,10 @@ def main() -> None:
         description="SRO: two-phase reflective self-evolution framework",
     )
     parser.add_argument("--demo", action="store_true", help="run built-in placeholder demo")
-    parser.add_argument("--dataset", choices=["gsm8k", "math", "aime", "hotpotqa"],
-                        help="load a real dataset and run the two-phase loop")
+    parser.add_argument("--dataset", type=_validate_dataset,
+                        help="load a real dataset and run the two-phase loop; "
+                             "single: gsm8k/math/aime/hotpotqa, or mixed 'a+b' "
+                             "(e.g. gsm8k+hotpotqa; aime not allowed in mixed)")
     # these default to .env values; CLI overrides when provided
     parser.add_argument("--n-train", type=int, default=cfg.n_train,
                         help=f"number of train samples (default from .env: {cfg.n_train})")

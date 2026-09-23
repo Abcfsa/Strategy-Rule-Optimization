@@ -103,24 +103,80 @@ class SROEngine:
         self.minibatch_size = minibatch_size
         self.max_prompt_length = max_prompt_length
         self.seed = seed
+        # 混合数据集状态（set_dataset 时更新；默认单数据集模式）
+        self.mixed = False
+        self.mixed_names: list[str] = []
+        self.judgers: dict = {}
+        self.formats: dict = {}
 
     def set_dataset(self, dataset: str, gepa_split: bool = False) -> None:
         """绑定数据集：把对应 evaluate_answer 注入 TaskLM.judger，
         并把该数据集的输出格式指令注入 TaskLM.dataset_format。
 
-        dataset: gsm8k / math / aime / hotpotqa。判分逻辑复用
-        openai_api_test 中已验证的函数，保证与基线一致。
+        dataset: gsm8k / math / aime / hotpotqa，或混合 "a+b"（如
+        gsm8k+hotpotqa）。混合模式下不注入单一 judger/format，改为构建
+        逐样本分发表 self.judgers / self.formats，由 TaskLM.run 的
+        judger/format_override 参数逐样本指定（训练与测试期均生效）。
 
         gepa_split: 仅 aime 生效，True 时用 ### 答案格式（对齐 GEPA）。
         """
         from .datasets import _import_eval
         from .llm import DATASET_FORMAT_INSTRUCTIONS
+        if "+" in dataset:
+            self.mixed = True
+            self.mixed_names = [n.strip() for n in dataset.split("+") if n.strip()]
+            judgers = {}
+            for nm in self.mixed_names:
+                j, _ = _import_eval(nm)
+                judgers[nm] = j
+            self.judgers = judgers
+            self.formats = {nm: DATASET_FORMAT_INSTRUCTIONS.get(nm, "")
+                            for nm in self.mixed_names}
+            # 混合模式：单一 judger/format 置空，强制走逐样本分发
+            self.task_lm.judger = None
+            self.task_lm.dataset_format = ""
+            return
+        self.mixed = False
+        self.mixed_names = []
+        self.judgers = {}
+        self.formats = {}
         judger, _ = _import_eval(dataset)
         self.task_lm.judger = judger
         if dataset == "aime" and gepa_split:
             self.task_lm.dataset_format = DATASET_FORMAT_INSTRUCTIONS.get("aime_gepa", "")
         else:
             self.task_lm.dataset_format = DATASET_FORMAT_INSTRUCTIONS.get(dataset, "")
+
+    # ---- 混合模式辅助：按样本取逐样本 judger / 格式指令 ----
+    def _per_sample_judger(self, sample: TrainSample):
+        """混合模式返回该样本数据集的 judger；单数据集返回 None（走
+        TaskLM.judger 注入路径）。未知标签回退 None。"""
+        if not self.mixed:
+            return None
+        return self.judgers.get(getattr(sample, "dataset", ""), None)
+
+    def _per_sample_format(self, sample: TrainSample) -> Optional[str]:
+        """混合模式返回该样本数据集的格式指令；单数据集返回 None。"""
+        if not self.mixed:
+            return None
+        return self.formats.get(getattr(sample, "dataset", ""), None)
+
+    def grade(self, sample: TrainSample, answer: str) -> bool:
+        """统一判分入口（Phase 2 / main.py 用）：混合模式逐样本判分，
+        单数据集走 TaskLM.judger 或内置 is_correct。"""
+        j = self._per_sample_judger(sample)
+        if j is not None:
+            try:
+                return bool(j(answer, sample.answer))
+            except Exception:
+                return False
+        if self.task_lm.judger is not None:
+            try:
+                return bool(self.task_lm.judger(answer, sample.answer))
+            except Exception:
+                return False
+        return self.task_lm.is_correct(
+            answer, sample.answer, sample.answer_type)
 
     # ===================================================================
     # 阶段一：训练与反思迭代
@@ -165,6 +221,8 @@ class SROEngine:
                     context_examples=ctx_examples,
                     gold_answer=sample.answer,
                     answer_type=sample.answer_type,
+                    judger=self._per_sample_judger(sample),
+                    format_override=self._per_sample_format(sample),
                 )
                 traces.append(trace)
 
@@ -228,6 +286,8 @@ class SROEngine:
                     s.problem,
                     gold_answer=s.answer,
                     answer_type=s.answer_type,
+                    judger=self._per_sample_judger(s),
+                    format_override=self._per_sample_format(s),
                 )
                 for s in eval_subset
             ]
@@ -265,6 +325,8 @@ class SROEngine:
                 context_examples=ctx_examples,
                 gold_answer=sample.answer,
                 answer_type=sample.answer_type,
+                judger=self._per_sample_judger(sample),
+                format_override=self._per_sample_format(sample),
             )
             # inject gold_answer into context for reflect_gepa diagnostic feedback
             trace.context["gold_answer"] = sample.answer
@@ -284,6 +346,8 @@ class SROEngine:
                 context_examples=[],  # val eval: no KB context, pure strategy
                 gold_answer=sample.answer,
                 answer_type=sample.answer_type,
+                judger=self._per_sample_judger(sample),
+                format_override=self._per_sample_format(sample),
             )
             scores.append(1.0 if trace.result.correct else 0.0)
         self.task_lm.update_strategy(original)
@@ -642,12 +706,19 @@ class SROEngine:
         # 按 LLM 选中下标取规律，保持粗召回的相似度序，最多 top_k 条
         return [candidates[i] for i in indices[: self.top_k]]
 
-    def inference(self, question: str, verbose: bool = False) -> tuple[str, dict]:
+    def inference(self, question: str, verbose: bool = False,
+                  sample: Optional[TrainSample] = None) -> tuple[str, dict]:
         """测试推理，含命中/不匹配两条分支。
 
         返回 (answer, meta)，meta 记录走了哪条分支、命中了哪些规律。
         miss 时：若 dynamic_learning 开启则走动态学习，否则直接硬答。
+
+        sample: 混合数据集模式下传入原样本（取 dataset 标签做逐样本
+        判分器/格式指令分发）；单数据集可不传（None，走注入路径）。
         """
+        # 逐样本分发（混合模式生效；单数据集/None 时为 no-op）
+        s_judger = self._per_sample_judger(sample) if sample else None
+        s_format = self._per_sample_format(sample) if sample else None
         # ---- 匹配机制：按 test_match_method 分发 ----
         if self.test_use_patterns:
             if self.test_match_method == "llm":
@@ -664,17 +735,21 @@ class SROEngine:
 
         if hit:
             # ===== 命中分支：例子 + 长期策略 → TaskLM =====
-            trace = self.task_lm.run(question, context_examples=hits)
+            trace = self.task_lm.run(question, context_examples=hits,
+                                     judger=s_judger, format_override=s_format)
             answer = trace.result.answer
             meta["dynamic_added"] = False
             if verbose:
                 print(f"[MATCH] hit {len(hits)} patterns -> answering directly")
         elif self.dynamic_learning:
             # ===== 不匹配分支：动态学习机制 =====
-            answer, trace = self._dynamic_learning(question, meta, verbose)
+            answer, trace = self._dynamic_learning(
+                question, meta, verbose,
+                judger=s_judger, format_override=s_format)
         else:
             # ===== 不匹配且关闭动态学习：直接用长期策略硬答 =====
-            trace = self.task_lm.run(question, context_examples=[])
+            trace = self.task_lm.run(question, context_examples=[],
+                                     judger=s_judger, format_override=s_format)
             answer = trace.result.answer
             meta["dynamic_added"] = False
             if verbose:
@@ -686,12 +761,15 @@ class SROEngine:
         return answer, meta
 
     def _dynamic_learning(
-        self, question: str, meta: dict, verbose: bool
+        self, question: str, meta: dict, verbose: bool,
+        judger: Optional[callable] = None,
+        format_override: Optional[str] = None,
     ) -> tuple[str, Trace]:
         """不匹配时的动态学习：临时归纳规律→临时入库→第二轮测试。
 
         架构图中标注"待考虑"的部分：本阶段实现为可选的临时归纳，
         默认不永久入库（drop_tentative 会在 inference 末尾清掉）。
+        judger/format_override：混合模式逐样本分发（透传自 inference）。
         """
         # 1) ReflectionLM 从该问题临时归纳一条规律
         new_pattern = self.reflection_lm.extract_pattern_from_question(question)
@@ -707,7 +785,8 @@ class SROEngine:
                                    threshold=0.0)  # 临时放宽，确保取到刚加的
         else:
             hits = []  # test_use_patterns 关闭：规律照归纳入 KB，但不注入 context
-        trace = self.task_lm.run(question, context_examples=hits)
+        trace = self.task_lm.run(question, context_examples=hits,
+                                 judger=judger, format_override=format_override)
 
         meta["dynamic_added"] = True
         meta["tentative_pattern"] = new_pattern.text[:40]

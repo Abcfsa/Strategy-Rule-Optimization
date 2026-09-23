@@ -94,6 +94,7 @@ class TrainSample:
     problem: str
     answer: str
     answer_type: str = "exact"
+    dataset: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -479,15 +480,21 @@ class TaskLM:
         context_examples: Optional[list[Example]] = None,
         gold_answer: Optional[str] = None,
         answer_type: str = "exact",
+        judger: Optional[callable] = None,
+        format_override: Optional[str] = None,
     ) -> Trace:
         """在策略 + 检索到的短期规律下执行题目。
 
         context_examples: 命中的短期规律（few-shot 上下文）。
         gold_answer:      标准答案；提供则据 answer_type 判对错。
         answer_type:      exact / numeric / freeform。
+        judger:           逐样本判分器（混合数据集模式：gsm8k 数值比对 vs
+                          hotpotqa SQuAD 归一化）。None=用 self.judger。
+        format_override:  逐样本格式指令（混合模式：每道题用自己数据集的
+                          输出格式指令）。None=用 self.dataset_format。
         """
         few_shot = "\n".join(e.to_prompt_str() for e in (context_examples or []))
-        system_prompt = self._assemble_system_prompt(few_shot)
+        system_prompt = self._assemble_system_prompt(few_shot, format_override)
         # 记录附加上下文，供反思分析
         ctx = {"strategy_version": self.strategy.version,
                "n_examples": len(context_examples or []),
@@ -495,13 +502,18 @@ class TaskLM:
                "answer_type": answer_type,
                "gold_answer": gold_answer or ""}
         raw = self._call_llm(system_prompt, problem)
-        answer, correct = self._parse_output(raw, gold_answer, answer_type)
+        answer, correct = self._parse_output(
+            raw, gold_answer, answer_type, judger=judger)
         return Trace(problem=problem, trajectory=raw,
                      result=Result(answer=answer, correct=correct), context=ctx)
 
-    def _assemble_system_prompt(self, few_shot: str) -> str:
+    def _assemble_system_prompt(self, few_shot: str,
+                                format_override: Optional[str] = None) -> str:
         # 顺序：格式指令（数据集期望的输出方式）→ 长期策略 → few-shot 规律
-        base = self.dataset_format or "You are a careful problem solver."
+        # format_override（混合模式逐样本指令）优先于 dataset_format；
+        # 空串视为未提供（与 dataset_format 的 falsy 回退语义一致）。
+        base = format_override or self.dataset_format \
+            or "You are a careful problem solver."
         parts = [base]
         if self.strategy.text:
             parts.append(self.strategy.text)
@@ -604,17 +616,20 @@ class TaskLM:
         return p == g                    # exact 字符串比对
 
     def _parse_output(self, raw: str, gold_answer: Optional[str],
-                      answer_type: str) -> tuple[str, bool]:
+                      answer_type: str,
+                      judger: Optional[callable] = None) -> tuple[str, bool]:
         """抽取答案并据 gold_answer 判对错。无 gold_answer 时默认错。
 
-        优先用注入的 judger（数据集专用判分）；否则回退内置 is_correct。
+        judger（逐样本覆盖，混合模式）> self.judger（数据集注入）>
+        内置 is_correct。
         """
         answer = self.extract_answer(raw)
         if gold_answer is None:
             return answer, False
-        if self.judger is not None:
+        j = judger if judger is not None else self.judger
+        if j is not None:
             try:
-                return answer, bool(self.judger(answer, gold_answer))
+                return answer, bool(j(answer, gold_answer))
             except Exception:
                 return answer, False
         return answer, self.is_correct(answer, gold_answer, answer_type)
