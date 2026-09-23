@@ -139,6 +139,7 @@ def run_dataset(
     evo_mode: str, train_retrieve_ctx: bool, test_use_patterns: bool,
     aime_gepa_split: bool = False, pattern_gen_mode: str | None = None,
     test_match_method: str | None = None, reflect_wrong_only: bool | None = None,
+    regularized_verify: bool | None = None,
 ) -> None:
     """Load a real dataset and run the two-phase loop, then save outputs.
 
@@ -165,6 +166,7 @@ def run_dataset(
         pattern_gen_mode=pattern_gen_mode,
         test_match_method=test_match_method,
         reflect_wrong_only=reflect_wrong_only,
+        regularized_verify=regularized_verify,
     )
     engine.set_dataset(dataset, gepa_split=aime_gepa_split)   # inject the matching grader
 
@@ -205,6 +207,7 @@ def run_dataset(
         "pattern_gen_mode": engine.pattern_gen_mode,
         "test_match_method": engine.test_match_method,
         "reflect_wrong_only": engine.reflect_wrong_only,
+        "regularized_verify": engine.regularized_verify,
     }
     if output_dir is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -264,6 +267,12 @@ def main() -> None:
                         help="STEVE-style error-driven reflection: extract lessons/diagnostics ONLY from "
                              "wrong traces, filtering out noisy gradients from already-correct examples "
                              "(default from .env: REFLECT_WRONG_ONLY)")
+    parser.add_argument("--regularized-verify", action="store_true",
+                        default=None,
+                        help="STEVE regularized verification: gate candidate acceptance on the preservation "
+                             "set (initial-correct val samples), rejecting updates whose minibatch gain "
+                             "is outweighed by lambda_t * preservation regressions, lambda_t=1.5+0.1t "
+                             "(default from .env: REGULARIZED_VERIFY; GEPA mode only)")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="output directory (default: sro_output_<dataset>_<timestamp>)")
     args = parser.parse_args()
@@ -275,7 +284,8 @@ def main() -> None:
                     args.seed, args.dynamic_learning, args.output_dir,
                     args.evo_mode, args.train_retrieve_ctx, args.test_use_patterns,
                     args.aime_gepa_split, args.pattern_gen_mode,
-                    args.test_match_method, args.reflect_wrong_only)
+                    args.test_match_method, args.reflect_wrong_only,
+                    args.regularized_verify)
     else:
         parser.print_help()
 

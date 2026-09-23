@@ -56,6 +56,8 @@ DEFAULTS = {
     "PATTERN_DEDUP_THRESHOLD": "0.0",  # >0 时规律入库前与已有规律 cosine>=阈值则跳过(去重)；rich 建议 0.92
     # ---- 反思样本来源 ----
     "REFLECT_WRONG_ONLY": "false",  # true=STEVE式错误驱动：只用错误轨迹反思；false=错误+正确都用
+    # ---- STEVE 正则化验证（第二机制）----
+    "REGULARIZED_VERIFY": "false",  # true=GEPA候选接受前加保留集回归门控(λ_t=1.5+0.1(t-1))
     # ---- 测试时匹配方法 ----
     "TEST_MATCH_METHOD": "vector",  # vector=纯cosine(现状) / llm=向量粗召回+LLM精选(retrieve-then-rerank)
     "LLM_MATCH_RECALL_K": "10",     # llm 模式：向量粗召回的候选数（LLM 从中判断哪些真正适用）
@@ -117,6 +119,8 @@ class Config:
     pattern_dedup_threshold: float
     # 反思样本来源
     reflect_wrong_only: bool
+    # STEVE 正则化验证门控
+    regularized_verify: bool
     # 测试时匹配方法
     test_match_method: str
     llm_match_recall_k: int
@@ -173,6 +177,7 @@ class Config:
             pattern_max_traces=int(g("PATTERN_MAX_TRACES")),
             pattern_dedup_threshold=float(g("PATTERN_DEDUP_THRESHOLD")),
             reflect_wrong_only=_parse_bool(g("REFLECT_WRONG_ONLY")),
+            regularized_verify=_parse_bool(g("REGULARIZED_VERIFY")),
             test_match_method=g("TEST_MATCH_METHOD"),
             llm_match_recall_k=int(g("LLM_MATCH_RECALL_K")),
             match_judge_model=g("MATCH_JUDGE_MODEL"),

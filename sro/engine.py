@@ -64,6 +64,7 @@ class SROEngine:
         pattern_dedup_threshold: Optional[float] = None,  # None=读 .env
         test_match_method: Optional[str] = None,  # None=读 .env；vector/llm
         reflect_wrong_only: Optional[bool] = None,  # None=读 .env；STEVE式错误驱动
+        regularized_verify: Optional[bool] = None,  # None=读 .env；STEVE正则化验证门控
     ) -> None:
         from .config import get_config
         cfg = get_config()
@@ -77,6 +78,10 @@ class SROEngine:
         self.kb = kb or KnowledgeBase(self.embedder, dedup_threshold=dedup)
         self.pattern_gen_mode = self.reflection_lm.pattern_gen_mode
         self.reflect_wrong_only = self.reflection_lm.reflect_wrong_only
+        # STEVE 正则化验证门控（仅 gepa 模式生效）
+        self.regularized_verify = (cfg.regularized_verify
+                                   if regularized_verify is None
+                                   else bool(regularized_verify))
         self.test_match_method = (test_match_method or cfg.test_match_method).lower()
         if self.test_match_method not in ("vector", "llm"):
             raise ValueError(
@@ -315,6 +320,20 @@ class SROEngine:
             [c.val_scores for c in candidates], n_val)
         best_idx, best_score = 0, candidates[0].score
 
+        # STEVE Regularized Verification: preservation set = val samples the
+        # initial candidate already solves; later candidates must not regress
+        # on it (gate check at step 2g). Empty set -> gate is vacuous.
+        pres_idx: list[int] = []
+        if self.regularized_verify:
+            pres_idx = [i for i, s in enumerate(candidates[0].val_scores)
+                        if s >= 1.0]
+            if verbose:
+                print(f"[Gate] Regularized verification ON: preservation set"
+                      f" {len(pres_idx)}/{n_val}")
+                if not pres_idx:
+                    print("[Gate] WARNING: preservation set empty"
+                          " (base solves 0 val samples); gate is vacuous.")
+
         if verbose:
             print(f"[Init] Base candidate val score: {best_score:.2%}"
                   f" ({n_val} calls)")
@@ -383,11 +402,39 @@ class SROEngine:
                               f" ({new_sum} <= {old_sum}).")
                     continue
 
-                # 2g) accept -> full val eval -> update Pareto
+                # 2g) accept -> full val eval -> gate -> update Pareto
                 new_strat.val_scores = self._eval_candidate(
                     new_strat, val_for_pareto)
                 budget_used += n_val
                 new_strat.score = sum(new_strat.val_scores) / n_val
+
+                # STEVE gate (Algorithm 1, lines 17-19): accept only if
+                #   Improvement - lambda_t * max(0, Regression) > 0
+                # Improvement = 1/b * (new_sum - old_sum): normalized hard-batch
+                #   gain of the candidate vs the parent (SRO's minibatch is the
+                #   hard-case batch; step 2f already enforces it > 0).
+                # Regression = 1/k * (#preservation samples lost): fraction of
+                #   the preservation set the new candidate fails to keep.
+                # lambda_t = 1.5 + 0.1*t (STEVE default schedule), t counts
+                #   accepted iterations, so the gate gets stricter over time.
+                gate_lambda = gate_reg = None
+                if self.regularized_verify and pres_idx:
+                    lam = 1.5 + 0.1 * (iteration - 1)
+                    new_pres = [new_strat.val_scores[i] for i in pres_idx]
+                    reg = sum(1 for s in new_pres if s < 1.0)
+                    improvement = (new_sum - old_sum) / len(minibatch)
+                    regression = reg / len(pres_idx)
+                    gate_lambda, gate_reg = lam, regression
+                    if improvement - lam * max(0.0, regression) <= 0:
+                        if verbose:
+                            print(f"[Gate] Reject: improvement {improvement:.2f}"
+                                  f" - {lam:.1f} * regression {regression:.2f}"
+                                  f" ({reg}/{len(pres_idx)} lost) <= 0")
+                        continue
+                    if verbose:
+                        print(f"[Gate] Pass: improvement {improvement:.2f},"
+                              f" regressions {reg}/{len(pres_idx)},"
+                              f" lambda {lam:.1f}")
                 candidates.append(new_strat)
                 pareto_fronts = build_pareto_fronts(
                     [c.val_scores for c in candidates], n_val)
@@ -413,6 +460,8 @@ class SROEngine:
                     "accepted": True, "budget_used": budget_used,
                     "strategy_version": new_strat.version,
                     "strategy_text": new_strat.text,
+                    # STEVE gate trace (None when gate off / vacuous)
+                    "gate_lambda": gate_lambda, "gate_regression": gate_reg,
                 })
 
             except Exception as e:
