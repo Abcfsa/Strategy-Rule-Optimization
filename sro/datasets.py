@@ -21,6 +21,7 @@ import json
 import os
 import random
 import re
+import zlib
 from pathlib import Path
 from typing import Optional
 
@@ -104,14 +105,8 @@ def _load_math(n_train: int, n_val: int, seed: int):
     return _shuffle_split(items, n_train, n_val, seed)
 
 
-def _load_aime(n_train: int, n_val: int, seed: int, gepa_split: bool = False):
-    """AIME：本地 Arrow，aimo-validation-aime 作为 train+val 池。
-
-    gepa_split=True 时完全复刻 GEPA 的 init_dataset() 划分：
-    - 固定 random.Random(0) 打乱（忽略 seed 参数）
-    - 对半切：前半=train，后半=val（忽略 n_train/n_val）
-    - 答案加 "### " 前缀（GEPA 的答案格式）
-    """
+def _load_aime_items() -> list[TrainSample]:
+    """读 aimo-validation-aime Arrow，构造样本列表（裸答案）。"""
     try:
         from datasets import Dataset
     except ImportError as e:
@@ -127,22 +122,37 @@ def _load_aime(n_train: int, n_val: int, seed: int, gepa_split: bool = False):
         answer = str(it.get("answer", "")).strip()
         if problem and answer:
             items.append(TrainSample(problem=problem, answer=answer, answer_type="numeric"))
+    return items
 
+
+def _load_aime_gepa_split() -> tuple:
+    """完整复刻 GEPA init_dataset()：Random(0) 打乱 + 对半切 + "### " 前缀。
+
+    固定协议（不依赖 seed / 配额）。混合模式下由 load_mixed 按配额
+    从两半区各取前缀子集。
+    """
+    items = _load_aime_items()
+    random.Random(0).shuffle(items)
+    mid = len(items) // 2
+    train, val = items[:mid], items[mid:]
+    for s in train:
+        s.answer = "### " + s.answer
+    for s in val:
+        s.answer = "### " + s.answer
+    return train, val
+
+
+def _load_aime(n_train: int, n_val: int, seed: int, gepa_split: bool = False):
+    """AIME：本地 Arrow，aimo-validation-aime 作为 train+val 池。
+
+    gepa_split=True 时完全复刻 GEPA 的 init_dataset() 划分：
+    - 固定 random.Random(0) 打乱（忽略 seed 参数）
+    - 对半切：前半=train，后半=val（忽略 n_train/n_val）
+    - 答案加 "### " 前缀（GEPA 的答案格式）
+    """
     if gepa_split:
-        # 复刻 GEPA init_dataset(): random.Random(0) 打乱 + 对半切 + ### 前缀
-        import random as _r
-        _r.Random(0).shuffle(items)
-        mid = len(items) // 2
-        train = items[:mid]
-        val = items[mid:]
-        prefix = "### "
-        for t in train:
-            t.answer = prefix + t.answer
-        for t in val:
-            t.answer = prefix + t.answer
-        return train, val
-
-    return _shuffle_split(items, n_train, n_val, seed)
+        return _load_aime_gepa_split()
+    return _shuffle_split(_load_aime_items(), n_train, n_val, seed)
 
 
 def _load_hotpotqa(n_train: int, n_val: int, seed: int):
@@ -184,12 +194,16 @@ _LOADERS = {
 
 
 def load_mixed(name: str, n_train: int = 50, n_val: int = 30,
-               seed: int = 42) -> tuple:
+               seed: int = 42, aime_gepa_split: bool = False) -> tuple:
     """加载混合数据集（"a+b" 形式），返回 (train, val)。
 
-    各数据集独立调用 load() 划分（先分后混，保证各集内部 val 不与自己的
-    train 泄漏），n_train/n_val 均分给各数据集，样本打 dataset 标签，
-    最后合并 shuffle（同 seed）。
+    各数据集独立划分（先分后混，保证各集内部 val 不与自己的 train 泄漏），
+    n_train/n_val 均分给各数据集，样本打 dataset 标签，最后合并 shuffle
+    （同 seed）。
+
+    aime_gepa_split=True 时仅作用于 aime 成员：aime 侧先完整复刻 GEPA
+    划分（Random(0) 对半切 + ### 前缀），再按配额从两半区各取前缀子集；
+    其余成员照常 seed 划分，不受该 flag 影响。
     """
     names = [n.strip() for n in name.split("+") if n.strip()]
     if len(names) < 2:
@@ -198,18 +212,22 @@ def load_mixed(name: str, n_train: int = 50, n_val: int = 30,
     if unknown:
         raise ValueError(
             f"unknown dataset(s) {unknown}; choose from {list(_LOADERS)}")
-    # AIME 不参与混合：gepa_split 是其专属逻辑，且 ### 前缀与通用判分冲突
-    if "aime" in names:
-        raise ValueError("aime does not support mixed mode (gepa_split/### prefix)")
     # 均分（有余数时前面的数据集多分 1 条，保证总量贴近请求）
     k = len(names)
     tr = [n_train // k + (1 if i < n_train % k else 0) for i in range(k)]
     vl = [n_val // k + (1 if i < n_val % k else 0) for i in range(k)]
     trains, vals = [], []
     for nm, nt, nv in zip(names, tr, vl):
-        # 各数据集用独立 seed 派生（避免同 seed 下各集打乱顺序耦合）
-        sub_seed = seed + (hash(nm) % 10000)
-        t, v = _LOADERS[nm](nt, nv, sub_seed)
+        if nm == "aime" and aime_gepa_split:
+            # GEPA 协议侧：固定 Random(0) 对半切 + ### 前缀，按配额取各半区前缀
+            g_train, g_val = _load_aime_gepa_split()
+            t, v = g_train[:nt], g_val[:nv]
+        else:
+            # 各数据集用独立 seed 派生（避免同 seed 下各集打乱顺序耦合）。
+            # crc32 跨进程稳定（内置 hash() 因 PYTHONHASHSEED 随机化，会破坏
+            # 跨进程/对照实验的可复现性）
+            sub_seed = seed + (zlib.crc32(nm.encode()) % 10000)
+            t, v = _LOADERS[nm](nt, nv, sub_seed)
         for s in t:
             s.dataset = nm
         for s in v:
@@ -227,14 +245,14 @@ def load(dataset: str, n_train: int = 50, n_val: int = 30, seed: int = 42,
     """加载指定数据集，返回 (train, val): tuple[list[TrainSample], list[TrainSample]]。
 
     dataset: gsm8k / math / aime / hotpotqa，或混合 "a+b"（如 gsm8k+hotpotqa；
-    不支持 aime 混合，n_train/n_val 均分给各数据集）
+    n_train/n_val 均分给各数据集）
 
-    gepa_split: 仅 aime 生效，完全复刻 GEPA init_dataset() 划分（seed=0 + 对半切 + ### 前缀）。
+    gepa_split: aime 专属 GEPA 协议（seed=0 + 对半切 + ### 前缀）。单数据集
+    aime 时作用于全部数据；混合模式下仅作用于 aime 成员，其余成员不受影响。
     """
     if "+" in dataset:
-        if gepa_split:
-            raise ValueError("AIME_GEPA_SPLIT is incompatible with mixed datasets")
-        return load_mixed(dataset, n_train, n_val, seed)
+        return load_mixed(dataset, n_train, n_val, seed,
+                          aime_gepa_split=gepa_split)
     if dataset not in _LOADERS:
         raise ValueError(f"unknown dataset '{dataset}'; choose from {list(_LOADERS)}")
     if dataset == "aime":

@@ -119,6 +119,7 @@ class SROEngine:
         judger/format_override 参数逐样本指定（训练与测试期均生效）。
 
         gepa_split: 仅 aime 生效，True 时用 ### 答案格式（对齐 GEPA）。
+        混合模式下同样只作用于 aime 成员（其余成员走各自的普通判分/格式）。
         """
         from .datasets import _import_eval
         from .llm import DATASET_FORMAT_INSTRUCTIONS
@@ -130,8 +131,13 @@ class SROEngine:
                 j, _ = _import_eval(nm)
                 judgers[nm] = j
             self.judgers = judgers
-            self.formats = {nm: DATASET_FORMAT_INSTRUCTIONS.get(nm, "")
-                            for nm in self.mixed_names}
+            # aime 混入且 gepa_split 时，aime 样本用 GEPA 对齐的 ### 格式指令
+            self.formats = {
+                nm: (DATASET_FORMAT_INSTRUCTIONS.get("aime_gepa", "")
+                     if (nm == "aime" and gepa_split)
+                     else DATASET_FORMAT_INSTRUCTIONS.get(nm, ""))
+                for nm in self.mixed_names
+            }
             # 混合模式：单一 judger/format 置空，强制走逐样本分发
             self.task_lm.judger = None
             self.task_lm.dataset_format = ""

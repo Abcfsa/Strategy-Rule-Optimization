@@ -251,8 +251,8 @@ _VALID_DATASETS = ["gsm8k", "math", "aime", "hotpotqa"]
 def _validate_dataset(name: str) -> str:
     """Accept a single dataset name or a mixed 'a+b' combination.
 
-    Mixed mode: 2+ known datasets joined by '+'; aime is not allowed in
-    mixed mode (gepa_split / '###' prefix are aime-specific).
+    Mixed mode: 2+ known datasets joined by '+'; aime may appear as one of
+    the members (with --aime-gepa-split it takes the GEPA protocol side).
     """
     if "+" in name:
         parts = [p.strip() for p in name.split("+") if p.strip()]
@@ -263,9 +263,6 @@ def _validate_dataset(name: str) -> str:
         if bad:
             raise argparse.ArgumentTypeError(
                 f"unknown dataset(s) {bad}; choose from {_VALID_DATASETS}")
-        if "aime" in parts:
-            raise argparse.ArgumentTypeError(
-                "aime does not support mixed mode (gepa_split/### prefix)")
         return "+".join(parts)
     if name not in _VALID_DATASETS:
         raise argparse.ArgumentTypeError(
@@ -283,7 +280,8 @@ def main() -> None:
     parser.add_argument("--dataset", type=_validate_dataset,
                         help="load a real dataset and run the two-phase loop; "
                              "single: gsm8k/math/aime/hotpotqa, or mixed 'a+b' "
-                             "(e.g. gsm8k+hotpotqa; aime not allowed in mixed)")
+                             "(e.g. gsm8k+hotpotqa; with --aime-gepa-split, "
+                             "aime members use the GEPA protocol)")
     # these default to .env values; CLI overrides when provided
     parser.add_argument("--n-train", type=int, default=cfg.n_train,
                         help=f"number of train samples (default from .env: {cfg.n_train})")
@@ -320,7 +318,8 @@ def main() -> None:
                         help="disable KB retrieval during training")
     parser.add_argument("--aime-gepa-split", action="store_true",
                         default=cfg.aime_gepa_split,
-                        help="AIME only: replicate GEPA init_dataset() split (seed=0, half/half, ### answer prefix)")
+                        help="AIME only: replicate GEPA init_dataset() split (seed=0, half/half, ### answer prefix). "
+                             "In mixed mode, applies only to the aime member; other members keep their seeded splits")
     parser.add_argument("--pattern-gen-mode", choices=["basic", "rich"],
                         default=None,
                         help="short-term pattern generation mode: basic=max 6 patterns/reflect (default from .env), "
