@@ -63,17 +63,20 @@ class SROEngine:
         pattern_gen_mode: Optional[str] = None,   # None=读 .env；basic/rich
         pattern_dedup_threshold: Optional[float] = None,  # None=读 .env
         test_match_method: Optional[str] = None,  # None=读 .env；vector/llm
+        reflect_wrong_only: Optional[bool] = None,  # None=读 .env；STEVE式错误驱动
     ) -> None:
         from .config import get_config
         cfg = get_config()
         self.embedder = embedder or Embedder()
         self.task_lm = task_lm or TaskLM(self.embedder)
         self.reflection_lm = reflection_lm or ReflectionLM(
-            self.embedder, pattern_gen_mode=pattern_gen_mode)
+            self.embedder, pattern_gen_mode=pattern_gen_mode,
+            reflect_wrong_only=reflect_wrong_only)
         dedup = (cfg.pattern_dedup_threshold
                  if pattern_dedup_threshold is None else pattern_dedup_threshold)
         self.kb = kb or KnowledgeBase(self.embedder, dedup_threshold=dedup)
         self.pattern_gen_mode = self.reflection_lm.pattern_gen_mode
+        self.reflect_wrong_only = self.reflection_lm.reflect_wrong_only
         self.test_match_method = (test_match_method or cfg.test_match_method).lower()
         if self.test_match_method not in ("vector", "llm"):
             raise ValueError(

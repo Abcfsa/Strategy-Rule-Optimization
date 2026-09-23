@@ -674,7 +674,8 @@ class ReflectionLM:
     """
 
     def __init__(self, embedder: Optional[Embedder] = None,
-                 pattern_gen_mode: Optional[str] = None) -> None:
+                 pattern_gen_mode: Optional[str] = None,
+                 reflect_wrong_only: Optional[bool] = None) -> None:
         cfg = get_config()
         self.model = cfg.reflection_model
         self.timeout = cfg.reflection_timeout
@@ -693,6 +694,12 @@ class ReflectionLM:
             raise ValueError(
                 f"unknown pattern_gen_mode {self.pattern_gen_mode!r}; "
                 f"choose 'basic' or 'rich'")
+        # STEVE 式错误驱动反思：true 时只从错误轨迹提取规律/反馈，
+        # 过滤已正确样本的"噪声梯度"（STEVE, arXiv:2609.23716）
+        # 显式传入优先，否则读 .env
+        self.reflect_wrong_only = (cfg.reflect_wrong_only
+                                   if reflect_wrong_only is None
+                                   else bool(reflect_wrong_only))
 
     def _call_llm(self, system: str, user: str,
                   model: Optional[str] = None) -> str:
@@ -738,7 +745,11 @@ class ReflectionLM:
         """Build diagnostic feedback text from minibatch traces.
 
         Adapts v3's _build_diagnostic_feedback to SRO's Trace objects.
+        reflect_wrong_only=True 时只保留错误轨迹（STEVE 式错误驱动，
+        已正确样本的反馈是噪声梯度）。
         """
+        if self.reflect_wrong_only:
+            traces = [t for t in traces if not t.result.correct]
         lines = []
         for i, t in enumerate(traces):
             status = "CORRECT" if t.result.correct else "WRONG"
@@ -797,6 +808,8 @@ class ReflectionLM:
         """basic 模式：原有逻辑，每批最多 6 条规律。"""
         correct = [t for t in traces if t.result.correct]
         wrong = [t for t in traces if not t.result.correct]
+        if self.reflect_wrong_only:
+            correct = []   # 错误驱动：不从正确轨迹提取规律
         c = _get_client()
 
         patterns: list[Example] = []
@@ -859,6 +872,8 @@ class ReflectionLM:
         """
         correct = [t for t in traces if t.result.correct]
         wrong = [t for t in traces if not t.result.correct]
+        if self.reflect_wrong_only:
+            correct = []   # 错误驱动：不从正确轨迹提取规律
         cap = max(1, self.pattern_max_traces)
         c = _get_client()
 

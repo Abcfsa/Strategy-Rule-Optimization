@@ -54,6 +54,8 @@ DEFAULTS = {
     "PATTERN_GEN_MODE": "basic",  # basic=现状(每reflect最多6条) / rich=多角度+聚类(每reflect最多~35条)
     "PATTERN_MAX_TRACES": "8",    # rich 模式：wrong/correct 各取的最大 trace 数
     "PATTERN_DEDUP_THRESHOLD": "0.0",  # >0 时规律入库前与已有规律 cosine>=阈值则跳过(去重)；rich 建议 0.92
+    # ---- 反思样本来源 ----
+    "REFLECT_WRONG_ONLY": "false",  # true=STEVE式错误驱动：只用错误轨迹反思；false=错误+正确都用
     # ---- 测试时匹配方法 ----
     "TEST_MATCH_METHOD": "vector",  # vector=纯cosine(现状) / llm=向量粗召回+LLM精选(retrieve-then-rerank)
     "LLM_MATCH_RECALL_K": "10",     # llm 模式：向量粗召回的候选数（LLM 从中判断哪些真正适用）
@@ -113,6 +115,8 @@ class Config:
     pattern_gen_mode: str
     pattern_max_traces: int
     pattern_dedup_threshold: float
+    # 反思样本来源
+    reflect_wrong_only: bool
     # 测试时匹配方法
     test_match_method: str
     llm_match_recall_k: int
@@ -168,6 +172,7 @@ class Config:
             pattern_gen_mode=g("PATTERN_GEN_MODE"),
             pattern_max_traces=int(g("PATTERN_MAX_TRACES")),
             pattern_dedup_threshold=float(g("PATTERN_DEDUP_THRESHOLD")),
+            reflect_wrong_only=_parse_bool(g("REFLECT_WRONG_ONLY")),
             test_match_method=g("TEST_MATCH_METHOD"),
             llm_match_recall_k=int(g("LLM_MATCH_RECALL_K")),
             match_judge_model=g("MATCH_JUDGE_MODEL"),
