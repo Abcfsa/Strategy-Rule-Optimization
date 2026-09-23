@@ -139,7 +139,7 @@ def run_dataset(
     evo_mode: str, train_retrieve_ctx: bool, test_use_patterns: bool,
     aime_gepa_split: bool = False, pattern_gen_mode: str | None = None,
     test_match_method: str | None = None, reflect_wrong_only: bool | None = None,
-    regularized_verify: bool | None = None,
+    regularized_verify: bool | None = None, npo_window: int | None = None,
 ) -> None:
     """Load a real dataset and run the two-phase loop, then save outputs.
 
@@ -167,6 +167,7 @@ def run_dataset(
         test_match_method=test_match_method,
         reflect_wrong_only=reflect_wrong_only,
         regularized_verify=regularized_verify,
+        npo_window=npo_window,
     )
     engine.set_dataset(dataset, gepa_split=aime_gepa_split)   # inject the matching grader
 
@@ -208,6 +209,7 @@ def run_dataset(
         "test_match_method": engine.test_match_method,
         "reflect_wrong_only": engine.reflect_wrong_only,
         "regularized_verify": engine.regularized_verify,
+        "npo_window": engine.npo_window,
     }
     if output_dir is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -242,9 +244,15 @@ def main() -> None:
                         help="inject KB short-term patterns as context at test time (default from .env)")
     parser.add_argument("--no-test-patterns", dest="test_use_patterns", action="store_false",
                         help="disable injecting short-term patterns as context at test time")
-    parser.add_argument("--evo-mode", choices=["gepa", "classic"],
+    parser.add_argument("--evo-mode", choices=["gepa", "classic", "npo"],
                         default=cfg.evo_mode,
-                        help=f"evolution mode (default from .env: {cfg.evo_mode})")
+                        help=f"evolution mode: classic=full-train rounds / gepa=Pareto+budget / "
+                             f"npo=single-lineage sliding-window teacher revision "
+                             f"(default from .env: {cfg.evo_mode})")
+    parser.add_argument("--npo-window", type=int, default=None,
+                        help="NPO sliding-window size W: number of recent prompt versions the "
+                             "teacher sees (default from .env: NPO_WINDOW; W=1 degrades to "
+                             "memoryless single-round reflection)")
     parser.add_argument("--train-retrieve-ctx", action="store_true",
                         default=cfg.train_retrieve_ctx,
                         help="retrieve KB patterns during training (default from .env)")
@@ -285,7 +293,7 @@ def main() -> None:
                     args.evo_mode, args.train_retrieve_ctx, args.test_use_patterns,
                     args.aime_gepa_split, args.pattern_gen_mode,
                     args.test_match_method, args.reflect_wrong_only,
-                    args.regularized_verify)
+                    args.regularized_verify, args.npo_window)
     else:
         parser.print_help()
 

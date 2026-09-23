@@ -65,6 +65,7 @@ class SROEngine:
         test_match_method: Optional[str] = None,  # None=读 .env；vector/llm
         reflect_wrong_only: Optional[bool] = None,  # None=读 .env；STEVE式错误驱动
         regularized_verify: Optional[bool] = None,  # None=读 .env；STEVE正则化验证门控
+        npo_window: Optional[int] = None,           # None=读 .env；NPO滑动窗口W
     ) -> None:
         from .config import get_config
         cfg = get_config()
@@ -78,10 +79,14 @@ class SROEngine:
         self.kb = kb or KnowledgeBase(self.embedder, dedup_threshold=dedup)
         self.pattern_gen_mode = self.reflection_lm.pattern_gen_mode
         self.reflect_wrong_only = self.reflection_lm.reflect_wrong_only
-        # STEVE 正则化验证门控（仅 gepa 模式生效）
+        # STEVE 正则化验证门控（仅 gepa 模式生效；npo 模式下警告并忽略——
+        # NPO 的哲学是无接受门控、无条件进链，加门控就不是 NPO 了）
         self.regularized_verify = (cfg.regularized_verify
                                    if regularized_verify is None
                                    else bool(regularized_verify))
+        # NPO 滑动窗口 W（仅 npo 模式生效）
+        self.npo_window = (cfg.npo_window if npo_window is None
+                           else max(1, int(npo_window)))
         self.test_match_method = (test_match_method or cfg.test_match_method).lower()
         if self.test_match_method not in ("vector", "llm"):
             raise ValueError(
@@ -131,6 +136,8 @@ class SROEngine:
         """训练闭环。按 evo_mode 分流。返回每轮历史记录。"""
         if self.evo_mode == "gepa":
             return self._train_gepa(train_set, verbose)
+        if self.evo_mode == "npo":
+            return self._train_npo(train_set, n_iters, verbose)
         return self._train_classic(train_set, n_iters, candidates_per_iter, verbose)
 
     def _train_classic(
@@ -479,6 +486,135 @@ class SROEngine:
             print(f"\n[Done] Best candidate #{best_idx}"
                   f" val={best_score:.2%}, budget"
                   f" {budget_used}/{self.max_metric_calls}")
+        return history
+
+    # -------------------------------------------------------------------
+    # NPO 核心训练循环
+    # -------------------------------------------------------------------
+
+    def _train_npo(self, train_set: list[TrainSample], n_iters: int,
+                   verbose: bool) -> list[dict]:
+        """NPO-style training (arXiv:2608.27266 Algorithm 1): single lineage,
+        sliding-window teacher feedback, NO acceptance gate.
+
+        Differences from GEPA mode (by design, faithful to the paper):
+        - one prompt lineage, no candidate pool / Pareto / parent selection
+        - every revision is unconditionally chained in, even if val drops
+          (teacher sees the drop in its sliding window and can self-correct)
+        - per-iteration val eval is needed for the final best-on-val pick
+          (paper Figure 4 "per-iter val"); budget = n_iters * (mb + n_val)
+        - MAX_METRIC_CALLS is ignored (NPO's budget semantics is iterations Y)
+
+        SRO-specific additions (deviations from the paper, documented):
+        - KB coexistence: short patterns from each minibatch go to KB, same
+          as gepa mode (pure-NPO baseline: disable via TRAIN_RETRIEVE_CTX /
+          TEST_USE_PATTERNS)
+        - MAX_PROMPT_LENGTH guard: revision too long -> skip this round,
+          lineage keeps P(i) (paper has no length cap; prompts grow freely)
+        - REGULARIZED_VERIFY is ignored here (warned in train_and_reflect)
+        """
+        import random
+        from collections import deque
+
+        rng = random.Random(self.seed)
+        # Same split convention as gepa mode: first 1/4 of train = internal
+        # validation, rest = train pool. Real val split stays for main.py.
+        n_val = max(1, len(train_set) // 4)
+        val_subset = train_set[:n_val]
+        train_pool = train_set[n_val:]
+        if not train_pool:
+            train_pool = list(train_set)
+
+        if verbose and self.regularized_verify:
+            print("[Warn] REGULARIZED_VERIFY is GEPA-only (NPO has no"
+                  " acceptance gate by design); ignored.")
+
+        # Window of (Strategy, traces, val_score), oldest first, maxlen=W
+        window: deque = deque(maxlen=self.npo_window)
+
+        init_text = self.task_lm.strategy.text or _default_prompt()
+        current = Strategy(text=init_text, version=0)
+        current.val_scores = self._eval_candidate(current, val_subset)
+        current.score = sum(current.val_scores) / n_val
+        best, best_score = current, current.score
+        budget_used = n_val
+
+        if verbose:
+            print(f"[Init] P(0) val score: {best_score:.2%}"
+                  f" ({n_val} calls) | window W={self.npo_window}")
+
+        history: list[dict] = []
+        for it in range(1, n_iters + 1):
+            if verbose:
+                print(f"\n=== NPO iteration {it}/{n_iters}"
+                      f" (rollouts used {budget_used}) ===")
+            try:
+                # 1) sample minibatch, 2) run student, collect traces+rewards
+                mb_size = min(self.minibatch_size, len(train_pool))
+                minibatch = rng.sample(train_pool, mb_size)
+                traces = self._run_minibatch(current, minibatch)
+                budget_used += mb_size
+                mb_ok = sum(t.result.correct for t in traces)
+                window.append((current, traces, current.score))
+                if verbose:
+                    print(f"[Rollout] Minibatch {mb_ok}/{mb_size}"
+                          f" ({mb_size} calls)")
+
+                # 3-4) teacher revision from sliding-window feedback
+                new_text = self.reflection_lm.reflect_npo(list(window))
+                new_text = _clean_markdown(new_text)
+                if not new_text or new_text == current.text:
+                    if verbose:
+                        print("[Skip] Revision empty or identical;"
+                              " lineage keeps current version.")
+                    continue
+                if len(new_text) > self.max_prompt_length:
+                    if verbose:
+                        print(f"[Skip] Revision too long ({len(new_text)}"
+                              f" > {self.max_prompt_length}); lineage keeps"
+                              f" current version.")
+                    continue
+
+                # 5) unconditionally chain in the new version (NO gate),
+                #    then per-iter val eval for the best-on-val pick
+                nxt = Strategy(text=new_text, version=len(history) + 1,
+                               parent_version=current.version)
+                nxt.val_scores = self._eval_candidate(nxt, val_subset)
+                budget_used += n_val
+                nxt.score = sum(nxt.val_scores) / n_val
+                is_best = nxt.score > best_score
+                if is_best:
+                    best, best_score = nxt, nxt.score
+                current = nxt
+                if verbose:
+                    print(f"[Chain] P(v{nxt.version}) val={nxt.score:.2%}"
+                          f" ({n_val} calls){' * new best' if is_best else ''}")
+
+                # 6) KB coexistence: short patterns from this minibatch
+                patterns, _ = self.reflection_lm.reflect(traces)
+                self.kb.add_patterns(patterns)
+
+                history.append({
+                    "iteration": it, "evo_mode": "npo",
+                    "mb_correct": mb_ok, "mb_size": mb_size,
+                    "new_val_score": nxt.score,
+                    "is_best": is_best, "budget_used": budget_used,
+                    "strategy_version": nxt.version,
+                    "strategy_text": nxt.text,
+                })
+            except Exception as e:
+                if verbose:
+                    print(f"[Error] iteration {it}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                break
+
+        # best-on-val updates TaskLM + KB
+        self.kb.update_strategy(best)
+        self.task_lm.update_strategy(best)
+        if verbose:
+            print(f"\n[Done] Best version v{best.version}"
+                  f" val={best_score:.2%}, rollouts used {budget_used}")
         return history
 
     # ===================================================================

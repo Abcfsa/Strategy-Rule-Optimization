@@ -41,12 +41,14 @@ DEFAULTS = {
     "SEED": "42",
     "DYNAMIC_LEARNING": "true",
     "TEST_USE_PATTERNS": "true",
-    # ---- GEPA 进化模式参数 ----
+    # ---- 进化模式参数（classic / gepa / npo）----
     "EVO_MODE": "classic",
     "TRAIN_RETRIEVE_CTX": "true",
     "MAX_METRIC_CALLS": "150",
     "MINIBATCH_SIZE": "8",
     "MAX_PROMPT_LENGTH": "2000",
+    # ---- NPO 专属（仅 EVO_MODE=npo 生效）----
+    "NPO_WINDOW": "2",  # 滑动窗口 W：教师可见的最近版本数；1=无记忆单轮反思
     # ---- API 重试（服务端临时故障自动重试）----
     "MAX_RETRIES": "3",           # 0=不重试；可重试错误（5xx/连接/限流/超时）的最大重试次数
     "RETRY_BACKOFF_BASE": "2",    # 指数退避基数（秒），实际等待 base^attempt × (1±0.25 抖动)
@@ -110,6 +112,7 @@ class Config:
     max_metric_calls: int
     minibatch_size: int
     max_prompt_length: int
+    npo_window: int
     # API 重试
     max_retries: int
     retry_backoff_base: float
@@ -171,6 +174,7 @@ class Config:
             max_metric_calls=int(g("MAX_METRIC_CALLS")),
             minibatch_size=int(g("MINIBATCH_SIZE")),
             max_prompt_length=int(g("MAX_PROMPT_LENGTH")),
+            npo_window=max(1, int(g("NPO_WINDOW"))),
             max_retries=int(g("MAX_RETRIES")),
             retry_backoff_base=float(g("RETRY_BACKOFF_BASE")),
             pattern_gen_mode=g("PATTERN_GEN_MODE"),

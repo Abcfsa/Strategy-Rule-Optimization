@@ -1071,6 +1071,59 @@ class ReflectionLM:
         sys = ("You are an expert prompt engineer. Return ONLY the new instruction text.")
         return self._call_llm(system=sys, user=reflection_prompt)
 
+    # ---- NPO：滑动窗口教师反思 ----
+    def reflect_npo(self, window: list) -> str:
+        """NPO teacher revision (arXiv:2608.27266 Algorithm 1, step 6).
+
+        window: list of (Strategy, list[Trace], val_score) tuples, oldest first
+        (the sliding window of the W most recent iterations). The teacher sees
+        each version's full prompt text, rollout traces with per-example
+        rewards, and the version's validation score, then writes the next
+        prompt version as a complete replacement.
+
+        Per-version rollout display is capped at pattern_max_traces examples
+        to keep the teacher context bounded; the remaining examples are
+        summarized by counts. reflect_wrong_only filtering applies through
+        _build_diagnostic_feedback (orthogonal mechanism).
+        """
+        sections = []
+        for v, (strategy, traces, val_score) in enumerate(window, start=1):
+            n_ok = sum(1 for t in traces if t.result.correct)
+            shown = traces[: self.pattern_max_traces]
+            omitted = len(traces) - len(shown)
+            section = (
+                f"=== Prompt version {v} (validation score P({v}) = {val_score:.3f}) ===\n"
+                f"Prompt text:\n```\n{strategy.text}\n```\n\n"
+                f"Rollouts for version {v} ({n_ok}/{len(traces)} correct):\n"
+                f"{self._build_diagnostic_feedback(shown)}\n"
+            )
+            if omitted > 0:
+                section += f"({omitted} more rollouts omitted for brevity)\n"
+            sections.append(section)
+
+        teacher_prompt = (
+            f"You are a reflection model optimizing an agent's instruction.\n\n"
+            f"Below is the recent optimization history: each prompt version, "
+            f"the rollouts it produced (with per-example correctness), and its "
+            f"validation score. Versions are listed oldest first.\n\n"
+            + "\n".join(sections) +
+            f"\n---\n"
+            f"Your task: write the NEXT version of the instruction.\n\n"
+            f"Use the full history:\n"
+            f"1. Identify what changed between versions and how validation "
+            f"scores responded — keep the changes that helped, revert or fix "
+            f"the ones that hurt.\n"
+            f"2. Diagnose the failure modes visible in the latest rollouts "
+            f"(reasoning gaps, format issues, missing verification).\n"
+            f"3. Encode generalizable problem-solving heuristics that the "
+            f"current instruction omits.\n\n"
+            f"Provide the new instruction within ``` blocks.\n"
+            f"The new instruction must be a complete replacement (not a diff "
+            f"or patch). Do NOT include explanations — only the new instruction."
+        )
+        sys = ("You are an expert prompt engineer. Return ONLY the new instruction text.")
+        return self._call_llm(system=sys, user=teacher_prompt)
+
     # ---- 阶段二：单题动态归纳 ----
     def extract_pattern_from_question(self, question: str) -> Example:
         """对未命中的测试问题临时归纳一条短期规律（动态学习机制）。"""
