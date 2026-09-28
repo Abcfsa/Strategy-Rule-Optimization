@@ -693,6 +693,33 @@ class SROEngine:
     # 阶段二：测试与推理
     # ===================================================================
 
+    def run_initial_baseline(self, val: list[TrainSample]) -> list[dict]:
+        """初始 prompt 基线：训练前用当前（初始）策略直接硬答 val。
+
+        不检索 KB、不动态学习——衡量"零训练的初始 prompt"水平，
+        与 Phase 2 最终成绩之差即 SRO 全流程的提升量。
+        只应在 train_and_reflect 之前调用（此后策略已被进化污染）。
+        必须在 set_dataset 之后调用（判分走同一 judger，保证可比）。
+        """
+        results: list[dict] = []
+        correct = 0
+        for i, sample in enumerate(val, 1):
+            trace = self.task_lm.run(
+                sample.problem, gold_answer=sample.answer,
+                answer_type=sample.answer_type)
+            ok = trace.result.correct
+            correct += ok
+            results.append({
+                "index": i,
+                "problem": sample.problem,
+                "prediction": trace.result.answer,
+                "gold": sample.answer,
+                "correct": bool(ok),
+            })
+        acc = correct / len(val) if val else 0.0
+        print(f"\n[Phase 0] initial-prompt baseline: {correct}/{len(val)} = {acc:.2%}")
+        return results
+
     def inference(self, question: str, verbose: bool = False) -> tuple[str, dict]:
         """测试推理，含命中/不匹配两条分支。
 

@@ -50,6 +50,7 @@ def demo() -> None:
 def _save_outputs(
     out_dir: Path, dataset: str, cfg, run_params: dict,
     history: list[dict], val_results: list[dict], engine: SROEngine,
+    initial_baseline: list[dict] | None = None,
 ) -> None:
     """Save run artifacts to out_dir (mirrors gepa_aime_v3 multi-file output).
 
@@ -105,6 +106,21 @@ def _save_outputs(
         "val_total": len(val_results),
         "val_accuracy": (val_correct / len(val_results) if val_results else 0.0),
     }
+    # 初始 prompt 基线（Phase 0）：训练前的 val 成绩 + 最终 vs 初始的提升
+    if initial_baseline:
+        base_correct = sum(1 for r in initial_baseline if r["correct"])
+        summary["initial_prompt"] = {
+            "correct": base_correct,
+            "total": len(initial_baseline),
+            "accuracy": (base_correct / len(initial_baseline)
+                         if initial_baseline else 0.0),
+        }
+        if val_results:
+            summary["val_improvement_vs_initial"] = (
+                val_correct / len(val_results) - base_correct / len(initial_baseline))
+    else:
+        summary["initial_prompt"] = None
+        summary["val_improvement_vs_initial"] = None
     (out_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -143,10 +159,12 @@ def run_dataset(
     seed: int, dynamic_learning: bool, output_dir: str | None,
     evo_mode: str, train_retrieve_ctx: bool, test_use_patterns: bool,
     use_merge: bool = True, max_merge_invocations: int = 10,
+    skip_initial_baseline: bool = False,
 ) -> None:
     """Load a real dataset and run the two-phase loop, then save outputs.
 
-    Phase 1: reflect-and-iterate on train; Phase 2: inference + eval on val.
+    Phase 0 (optional): initial-prompt baseline on val; Phase 1: reflect-and-iterate
+    on train; Phase 2: inference + eval on val.
     """
     from sro.datasets import load
 
@@ -168,6 +186,14 @@ def run_dataset(
         use_merge=use_merge, max_merge_invocations=max_merge_invocations,
     )
     engine.set_dataset(dataset)   # inject the matching grader
+
+    # Phase 0：初始 prompt 基线（策略=初始版本、KB=空时硬答 val）。
+    # 跳过时 summary 的 initial_prompt 字段记 null。
+    initial_baseline: list[dict] | None = None
+    if skip_initial_baseline:
+        print("\n[Phase 0] initial-prompt baseline: skipped (--skip-initial-baseline)")
+    else:
+        initial_baseline = engine.run_initial_baseline(val)
 
     print(f"\n########## Phase 1: Training & Reflection Loop ({n_iters} iters) ##########")
     history = engine.train_and_reflect(train, n_iters=n_iters, verbose=True)
@@ -207,7 +233,8 @@ def run_dataset(
     if output_dir is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = f"sro_output_{dataset}_{ts}"
-    _save_outputs(Path(output_dir), dataset, cfg, run_params, history, val_results, engine)
+    _save_outputs(Path(output_dir), dataset, cfg, run_params, history,
+                  val_results, engine, initial_baseline)
 
 
 def main() -> None:
@@ -254,6 +281,9 @@ def main() -> None:
     parser.add_argument("--max-merge-invocations", type=int,
                         default=cfg.max_merge_invocations,
                         help=f"max merge attempts in GEPA mode (default from .env: {cfg.max_merge_invocations})")
+    parser.add_argument("--skip-initial-baseline", action="store_true",
+                        help="skip the Phase 0 initial-prompt baseline on val "
+                             "(saves |val| extra LLM calls; summary fields become null)")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="output directory (default: sro_output_<dataset>_<timestamp>)")
     args = parser.parse_args()
@@ -264,7 +294,8 @@ def main() -> None:
         run_dataset(args.dataset, args.n_train, args.n_val, args.n_iters,
                     args.seed, args.dynamic_learning, args.output_dir,
                     args.evo_mode, args.train_retrieve_ctx, args.test_use_patterns,
-                    args.use_merge, args.max_merge_invocations)
+                    args.use_merge, args.max_merge_invocations,
+                    args.skip_initial_baseline)
     else:
         parser.print_help()
 
