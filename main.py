@@ -50,6 +50,7 @@ def demo() -> None:
 def _save_outputs(
     out_dir: Path, dataset: str, cfg, run_params: dict,
     history: list[dict], val_results: list[dict], engine: SROEngine,
+    initial_baseline: list[dict] | None = None,
 ) -> None:
     """Save run artifacts to out_dir (mirrors gepa_aime_v3 multi-file output).
 
@@ -111,6 +112,38 @@ def _save_outputs(
         "val_accuracy": (val_correct / len(val_results) if val_results else 0.0),
         "per_dataset_accuracy": per_ds,   # {} for single-dataset runs
     }
+    # 初始 prompt 基线（Phase 0）：训练前的 val 成绩 + 最终 vs 初始的提升。
+    # 混合模式同样做 per-dataset 分桶（与 per_dataset_accuracy 口径一致）。
+    if initial_baseline:
+        base_correct = sum(1 for r in initial_baseline if r["correct"])
+        base_per_ds: dict[str, dict] = {}
+        for r in initial_baseline:
+            ds = r.get("dataset", "")
+            if ds:
+                b = base_per_ds.setdefault(ds, {"correct": 0, "total": 0})
+                b["total"] += 1
+                b["correct"] += 1 if r["correct"] else 0
+        for b in base_per_ds.values():
+            b["accuracy"] = b["correct"] / b["total"] if b["total"] else 0.0
+        summary["initial_prompt"] = {
+            "correct": base_correct,
+            "total": len(initial_baseline),
+            "accuracy": (base_correct / len(initial_baseline)
+                         if initial_baseline else 0.0),
+            "per_dataset_accuracy": base_per_ds,   # {} for single-dataset runs
+        }
+        if val_results:
+            summary["val_improvement_vs_initial"] = (
+                val_correct / len(val_results) - base_correct / len(initial_baseline))
+            # per-dataset 提升（同名桶两侧都存在时才报，避免除零/空桶）
+            if per_ds and base_per_ds:
+                summary["improvement_per_dataset"] = {
+                    ds: per_ds[ds]["accuracy"] - base_per_ds[ds]["accuracy"]
+                    for ds in per_ds if ds in base_per_ds and per_ds[ds]["total"]
+                }
+    else:
+        summary["initial_prompt"] = None
+        summary["val_improvement_vs_initial"] = None
     (out_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -151,10 +184,12 @@ def run_dataset(
     aime_gepa_split: bool = False, pattern_gen_mode: str | None = None,
     test_match_method: str | None = None, reflect_wrong_only: bool | None = None,
     regularized_verify: bool | None = None, npo_window: int | None = None,
+    skip_initial_baseline: bool = False,
 ) -> None:
     """Load a real dataset and run the two-phase loop, then save outputs.
 
-    Phase 1: reflect-and-iterate on train; Phase 2: inference + eval on val.
+    Phase 0 (optional): initial-prompt baseline on val; Phase 1: reflect-and-iterate
+    on train; Phase 2: inference + eval on val.
     """
     from sro.datasets import load
 
@@ -181,6 +216,14 @@ def run_dataset(
         npo_window=npo_window,
     )
     engine.set_dataset(dataset, gepa_split=aime_gepa_split)   # inject the matching grader
+
+    # Phase 0：初始 prompt 基线（策略=初始版本、KB=空时硬答 val）。
+    # 混合模式下逐样本 judger/format 分发生效。跳过时 summary 记 null。
+    initial_baseline: list[dict] | None = None
+    if skip_initial_baseline:
+        print("\n[Phase 0] initial-prompt baseline: skipped (--skip-initial-baseline)")
+    else:
+        initial_baseline = engine.run_initial_baseline(val)
 
     print(f"\n########## Phase 1: Training & Reflection Loop ({n_iters} iters) ##########")
     history = engine.train_and_reflect(train, n_iters=n_iters, verbose=True)
@@ -242,7 +285,8 @@ def run_dataset(
     if output_dir is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = f"sro_output_{dataset}_{ts}"
-    _save_outputs(Path(output_dir), dataset, cfg, run_params, history, val_results, engine)
+    _save_outputs(Path(output_dir), dataset, cfg, run_params, history,
+                  val_results, engine, initial_baseline)
 
 
 _VALID_DATASETS = ["gsm8k", "math", "aime", "hotpotqa"]
@@ -339,6 +383,9 @@ def main() -> None:
                              "set (initial-correct val samples), rejecting updates whose minibatch gain "
                              "is outweighed by lambda_t * preservation regressions, lambda_t=1.5+0.1t "
                              "(default from .env: REGULARIZED_VERIFY; GEPA mode only)")
+    parser.add_argument("--skip-initial-baseline", action="store_true",
+                        help="skip the Phase 0 initial-prompt baseline on val "
+                             "(saves |val| extra LLM calls; summary fields become null)")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="output directory (default: sro_output_<dataset>_<timestamp>)")
     args = parser.parse_args()
@@ -351,7 +398,8 @@ def main() -> None:
                     args.evo_mode, args.train_retrieve_ctx, args.test_use_patterns,
                     args.aime_gepa_split, args.pattern_gen_mode,
                     args.test_match_method, args.reflect_wrong_only,
-                    args.regularized_verify, args.npo_window)
+                    args.regularized_verify, args.npo_window,
+                    args.skip_initial_baseline)
     else:
         parser.print_help()
 

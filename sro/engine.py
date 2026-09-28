@@ -691,6 +691,47 @@ class SROEngine:
     # 阶段二：测试与推理
     # ===================================================================
 
+    def run_initial_baseline(self, val: list[TrainSample]) -> list[dict]:
+        """初始 prompt 基线：训练前用当前（初始）策略直接硬答 val。
+
+        不检索 KB、不动态学习——衡量"零训练的初始 prompt"水平，
+        与 Phase 2 最终成绩之差即 SRO 全流程的提升量。
+        混合数据集模式：逐样本 judger/format 分发生效（与 Phase 2 同判分口径）。
+        只应在 train_and_reflect 之前调用（此后策略已被进化污染）。
+        必须在 set_dataset 之后调用（判分走同一 judger，保证可比）。
+        """
+        results: list[dict] = []
+        correct = 0
+        for i, sample in enumerate(val, 1):
+            trace = self.task_lm.run(
+                sample.problem, gold_answer=sample.answer,
+                answer_type=sample.answer_type,
+                judger=self._per_sample_judger(sample),
+                format_override=self._per_sample_format(sample))
+            ok = trace.result.correct
+            correct += ok
+            results.append({
+                "index": i,
+                "problem": sample.problem,
+                "prediction": trace.result.answer,
+                "gold": sample.answer,
+                "correct": bool(ok),
+                "dataset": getattr(sample, "dataset", ""),
+            })
+        acc = correct / len(val) if val else 0.0
+        print(f"\n[Phase 0] initial-prompt baseline: {correct}/{len(val)} = {acc:.2%}")
+        # 混合模式：per-dataset 分桶（与 Phase 2 报告口径一致）
+        buckets: dict[str, list[bool]] = {}
+        for r in results:
+            if r["dataset"]:
+                buckets.setdefault(r["dataset"], []).append(r["correct"])
+        if buckets:
+            print("initial-prompt per-dataset accuracy:")
+            for ds, flags in sorted(buckets.items()):
+                print(f"  {ds}: {sum(flags)}/{len(flags)}"
+                      f" = {sum(flags) / len(flags):.2%}")
+        return results
+
     def _llm_match(self, question: str) -> list:
         """LLM 匹配：向量粗召回 top-recall_k → LLM 判断适用性 → 取前 top_k 条。
 
