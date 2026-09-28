@@ -526,48 +526,83 @@ class TaskLM:
     def extract_answer(raw: str) -> str:
         """从 LLM 原始输出抽取最终答案。
 
-        覆盖模型常见输出格式（按优先级）：
+        终答标记几乎总在 CoT 末尾，而解题过程中充满行内数学（$1$ through
+        $20$）与复述数字——因此所有标记规则均取【最后一次】匹配，且多类
+        标记之间按"谁更靠近文末谁赢"（last-marker-wins），避免抓到 CoT
+        中段的数字：
+
           1. \\boxed{...}        —— LaTeX 标准答案包装
-          2. "The answer is X" / "最终答案: X" / "答案是X"
-          3. <answer>X</answer> 标签
-          4. $X$ / \\$X$ / **X** 行内包装里的数字
-          5. 文本中最后一个数字（兜底）
-        找不到则返回去掉首尾空白的原文。
+          2. ### <数字>          —— GEPA/AIME 终答标记（#### N 亦兼容）
+          3. "The answer is X" / "Answer: X" / "最终答案: X"
+          4. <answer>X</answer> 标签
+          5. $X$ / \\$X$ / **X** 行内包装里的数字
+          6. 文本中最后一个数字（兜底）
+        规则 1-5 按出现位置竞争；都找不到则走 6；再找不到返回去掉首尾
+        空白的原文。
         """
         import re
-        # 1) \boxed{...}（用最后一个 \boxed，通常是最终答案）
+        candidates: list[tuple[int, str]] = []   # (标记起始位置, 抽取值)
+
+        # 1) \boxed{...}（取最后一个；花括号配对，支持嵌套）
         last = raw.rfind("\\boxed")
         if last != -1:
             start = raw.find("{", last)
             if start != -1:
                 depth = 0
+                closed = False
                 for i in range(start, len(raw)):
                     if raw[i] == "{":
                         depth += 1
                     elif raw[i] == "}":
                         depth -= 1
                         if depth == 0:
-                            return raw[start + 1:i].strip()
-                return raw[start + 1:].strip()
-        # 2) "The answer is X" / "最终答案: X" / "答案是X"
-        m = re.search(
-            r"(?:final answer|the answer is|answer is|最终答案|答案(?:是为|是|:))\s*[:：]?\s*(.+?)(?:[.。]?\s*$|\n)",
+                            candidates.append((last, raw[start + 1:i].strip()))
+                            closed = True
+                            break
+                if not closed:
+                    candidates.append((last, raw[start + 1:].strip()))
+
+        # 2) ### <数字> 终答标记（GEPA/AIME 格式；取最后一个。
+        #    要求 # 后紧跟数字，markdown 标题 "### Solution" 不会误中）
+        m = None
+        for m in re.finditer(r"#{3,4}\s*(-?\d[\d,]*(?:\.\d+)?)", raw):
+            pass
+        if m:
+            candidates.append((m.start(), m.group(1)))
+
+        # 3) "The answer is X" / "Answer: X" / "最终答案: X"（取最后一个）
+        m = None
+        for m in re.finditer(
+            r"(?:final answer|the answer is|answer is|answer\s*[:：]|最终答案|答案(?:是为|是|:))"
+            r"\s*[:：]?\s*(.+?)(?:[.。]?\s*$|\n)",
             raw, re.IGNORECASE,
-        )
+        ):
+            pass
+        if m and m.group(1).strip():
+            candidates.append((m.start(), m.group(1).strip()))
+
+        # 4) <answer>X</answer> 标签（取最后一个）
+        m = None
+        for m in re.finditer(r"<answer>\s*(.+?)\s*</answer>", raw, re.IGNORECASE):
+            pass
+        if m and m.group(1).strip():
+            candidates.append((m.start(), m.group(1).strip()))
+
+        # 5) $X$ / \$X$ / **X** 行内包装的数字（取最后一个）
+        m = None
+        for m in re.finditer(r"\$\\?([-\d,.]+)\$|\*\*([-\d,.]+)\*\*", raw):
+            pass
         if m:
-            cand = m.group(1).strip()
-            # 若候选是 "X words" 这类，提取首个数字
-            return cand
-        # 3) <answer>X</answer> 标签
-        m = re.search(r"<answer>\s*(.+?)\s*</answer>", raw, re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-        # 4) $X$ / \$X$ / **X** 行内包装
-        m = re.search(r"\$\\?([-\d,.]+)\$|\*\*([-\d,.]+)\*\*", raw)
-        if m:
-            return next(g for g in m.groups() if g)
-        # 5) 文本中最后一个数字（含逗号千分位/小数/分数）
-        #    先匹配带逗号的千分位（整体），再匹配套路纯数字
+            val = next(g for g in m.groups() if g)
+            candidates.append((m.start(), val))
+
+        # 规则 1-5 按位置竞争：越靠近文末越可能是终答
+        if candidates:
+            _, val = max(candidates, key=lambda c: c[0])
+            if val:
+                return val
+
+        # 6) 文本中最后一个数字（含逗号千分位/小数/分数）
         nums = re.findall(r"-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|-?\d+(?:\.\d+)?(?:/\d+)?", raw)
         if nums:
             return nums[-1].replace(" ", "")
