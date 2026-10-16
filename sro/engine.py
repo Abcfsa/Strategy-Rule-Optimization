@@ -108,19 +108,22 @@ class SROEngine:
         """绑定数据集：把对应 evaluate_answer 注入 TaskLM.judger，
         并把该数据集的输出格式指令注入 TaskLM.dataset_format。
 
-        dataset: gsm8k / math / aime / hotpotqa。判分逻辑复用
+        dataset: gsm8k / math / aime / hotpotqa / ifbench / livebench / pupa。判分逻辑复用
         openai_api_test 中已验证的函数，保证与基线一致。
 
         gepa_split: 仅 aime 生效，True 时用 ### 答案格式（对齐 GEPA）。
         """
         from .datasets import _import_eval
-        from .llm import DATASET_FORMAT_INSTRUCTIONS
+        from .llm import DATASET_FORMAT_INSTRUCTIONS, DATASET_ANSWER_TYPES
         judger, _ = _import_eval(dataset)
         self.task_lm.judger = judger
         if dataset == "aime" and gepa_split:
             self.task_lm.dataset_format = DATASET_FORMAT_INSTRUCTIONS.get("aime_gepa", "")
         else:
             self.task_lm.dataset_format = DATASET_FORMAT_INSTRUCTIONS.get(dataset, "")
+        # 注入数据集答案类型：verifiable/redaction 让 run()/_parse_output 对
+        # 完整回答判分（不做答案抽取）。
+        self.task_lm.dataset_answer_type = DATASET_ANSWER_TYPES.get(dataset, "exact")
 
     # ===================================================================
     # 阶段一：训练与反思迭代

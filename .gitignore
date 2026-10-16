@@ -28,3 +28,6 @@ data/
 .DS_Store
 
 docs/
+
+# vendored IFBench verifier 的本地 nltk 语料缓存（instructions.py import 时创建）
+sro/ifbench_verifier/.nltk_data/

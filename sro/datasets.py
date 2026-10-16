@@ -1,22 +1,33 @@
-"""数据集加载：HotpotQA / GSM8K / MATH / AIME。
+"""数据集加载：HotpotQA / GSM8K / MATH / AIME / IFBench / LiveBench / PUPA。
 
 划分方法（参考 openai_api_test 脚本，统一只用 train + val，无 test）：
     - 各数据集从其 train 池 shuffle 后切分：先取 n_val 做 val，再取 n_train 做 train
       （val 在前，train 数量变动不影响 val 集稳定性）
     - HotpotQA 用原生 train/dev 文件，dev 当 val
     - AIME 用 aimo-validation-aime 作为 train+val 池
+    - IFBench / LiveBench 是纯 test 集（无 train 标注），按同一 _shuffle_split
+      从 test 池切出 train+val 供 SRO 两阶段闭环使用
 
 判分逻辑在 sro/grading.py 内联实现（从 openai_api_test 移植的纯函数），
 SRO 自包含。答案类型：
     gsm8k / aime / math → numeric（math 走 LaTeX 数值求值）
     hotpotqa            → freeform（SQuAD 风格归一化匹配）
+    ifbench / livebench → verifiable（完整回答逐约束 check_following）
+    pupa                → redaction（完整输出 PII 泄漏检查）
+
+verifiable / redaction 两类的 answer 字段不是单个答案串，而是结构化约束的
+JSON 编码（见 grading.py 各 judger 的 gold 约定）；engine 对这两类不做答案
+抽取，直接把模型完整 raw 交给 judger。
 
 数据集本地路径（相对 SRO 仓库根，可在 config 覆盖）：
     ../gsm8k/main/   ../MATH/   ../HotpotQA/raw/   ../AIME/
+    ../IFBench/IFBench_test/   ../livebench_instruction_following/
+    ../PAPILLON/pupa/
 """
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import random
@@ -63,12 +74,15 @@ def _data_dir(name: str) -> Path:
         "math": repo_root.parent / "MATH",
         "hotpotqa": repo_root.parent / "HotpotQA" / "raw",
         "aime": repo_root.parent / "AIME",
+        "ifbench": repo_root.parent / "IFBench" / "IFBench_test",
+        "livebench": repo_root.parent / "livebench_instruction_following",
+        "pupa": repo_root.parent / "PAPILLON" / "pupa",
     }
     return default[name]
 
 
 # ---------------------------------------------------------------------------
-# 四个 loader
+# QA / 数学类 loader（gsm8k / math / aime / hotpotqa）
 # ---------------------------------------------------------------------------
 
 
@@ -172,6 +186,152 @@ def _load_hotpotqa(n_train: int, n_val: int, seed: int):
 
 
 # ---------------------------------------------------------------------------
+# 指令跟随 / 隐私脱敏 loader
+# ---------------------------------------------------------------------------
+
+
+def _read_parquet_rows(path: Path) -> list:
+    """读 parquet 为 list[dict]。优先 datasets 库，回退 pyarrow，都没有则报错。"""
+    try:
+        from datasets import load_dataset
+        # 显式把文件映射到 "train" 键，绕过 datasets 按文件名推断 split 的行为
+        # ——livebench 的 parquet 名为 test-*.parquet，若按名推断会被判为 test
+        # split，split="train" 随即报错（对齐 _load_gsm8k 的成熟写法）。
+        ds = load_dataset("parquet", data_files={"train": str(path)})["train"]
+        return [dict(r) for r in ds]
+    except ImportError:
+        pass
+    try:
+        import pyarrow.parquet as pq
+        return pq.read_table(str(path)).to_pylist()
+    except ImportError as e:
+        raise ImportError(
+            f"Reading {path.name} needs 'datasets' or 'pyarrow': "
+            f"pip install datasets  (or: pip install pyarrow)"
+        ) from e
+
+
+def _encode_if_gold(prompt: str, id_list, kwargs_list) -> str:
+    """把 IF 约束编码为 gold JSON（grading._evaluate_if_style 解析）。
+
+    kwargs 转 dict 列表并【剔除 None 值】：parquet 里每条 kwargs 带全量字段
+    （大多为 null），不剔除会让 gold JSON 膨胀到 1-5KB 并原样注入反思 prompt，
+    烧 token 且稀释诊断信号。judger 侧的 None 过滤保留作防御。
+    """
+    return json.dumps({
+        "prompt": prompt,
+        "instruction_id_list": list(id_list),
+        "kwargs": [{k: v for k, v in dict(kw).items() if v is not None}
+                   for kw in kwargs_list],
+    }, ensure_ascii=False)
+
+
+def _load_ifbench(n_train: int, n_val: int, seed: int):
+    """IFBench_test：单轮 prompt + 约束列表（OOD 约束为主）。
+
+    answer_type=verifiable，answer=约束 gold JSON；problem 用 prompt。
+    """
+    d = _data_dir("ifbench")
+    pq_path = d / "data" / "train-00000-of-00001.parquet"
+    if not pq_path.exists():
+        raise FileNotFoundError(f"IFBench parquet not found: {pq_path}")
+    rows = _read_parquet_rows(pq_path)
+    items: list[TrainSample] = []
+    for it in rows:
+        prompt = it.get("prompt", "")
+        ids = it.get("instruction_id_list", [])
+        kwargs = it.get("kwargs", [])
+        if not prompt or not ids:
+            continue
+        # ids 与 kwargs 必须一一对应（错位会让 judger 抛环境错，加载期就拦下）
+        if len(ids) != len(kwargs):
+            raise ValueError(
+                f"IFBench row key={it.get('key')!r}: {len(ids)} instruction ids "
+                f"vs {len(kwargs)} kwargs — data is malformed"
+            )
+        items.append(TrainSample(
+            problem=prompt,
+            answer=_encode_if_gold(prompt, ids, kwargs),
+            answer_type="verifiable",
+        ))
+    return _shuffle_split(items, n_train, n_val, seed)
+
+
+def _load_livebench(n_train: int, n_val: int, seed: int):
+    """LiveBench 指令跟随：单轮（turns[0]）+ 经典 IFEval 约束。
+
+    400 条全为单轮；problem 用 turns[0]，answer_type=verifiable。
+    """
+    d = _data_dir("livebench")
+    pq_path = d / "data" / "test-00000-of-00001.parquet"
+    if not pq_path.exists():
+        raise FileNotFoundError(
+            f"LiveBench parquet not found: {pq_path} "
+            f"(if it is a git-lfs pointer, run `git lfs pull` in {d})"
+        )
+    rows = _read_parquet_rows(pq_path)
+    items: list[TrainSample] = []
+    for it in rows:
+        turns = it.get("turns") or []
+        prompt = turns[0] if turns else it.get("task_prompt", "")
+        ids = it.get("instruction_id_list", [])
+        kwargs = it.get("kwargs", [])
+        if not prompt or not ids:
+            continue
+        if len(ids) != len(kwargs):
+            raise ValueError(
+                f"LiveBench row question_id={it.get('question_id')!r}: "
+                f"{len(ids)} instruction ids vs {len(kwargs)} kwargs — data is malformed"
+            )
+        items.append(TrainSample(
+            problem=prompt,
+            answer=_encode_if_gold(prompt, ids, kwargs),
+            answer_type="verifiable",
+        ))
+    return _shuffle_split(items, n_train, n_val, seed)
+
+
+def _load_pupa(n_train: int, n_val: int, seed: int):
+    """PUPA 隐私脱敏：user_query 含 PII，要求输出脱敏后 query。
+
+    answer_type=redaction，answer=gold JSON{pii_units, redacted_query}；
+    problem 用含 PII 的 user_query。默认读 PUPA_New.csv（PUPA_PATH 可覆盖）。
+    """
+    d = _data_dir("pupa")
+    cfg = get_config()
+    # PUPA_PATH 可指到目录（取其下 PUPA_New.csv）或直接指到某个 csv
+    # （如 PUPA_TNB.csv）；都未设时默认 <pupa 目录>/PUPA_New.csv
+    if cfg.pupa_path:
+        csv_path = Path(cfg.pupa_path)
+        if csv_path.is_dir():
+            csv_path = csv_path / "PUPA_New.csv"
+    else:
+        csv_path = d / "PUPA_New.csv"
+    if not csv_path.is_file():
+        raise FileNotFoundError(
+            f"PUPA csv not found: {csv_path} (set PUPA_PATH to a csv file or "
+            f"the pupa directory)"
+        )
+    items: list[TrainSample] = []
+    with open(csv_path, encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            query = (row.get("user_query") or "").strip()
+            pii_raw = (row.get("pii_units") or "").strip()
+            redacted = (row.get("redacted_query") or "").strip()
+            if not query or not pii_raw:
+                continue
+            pii_units = [p.strip() for p in pii_raw.split("||") if p.strip()]
+            items.append(TrainSample(
+                problem=query,
+                answer=json.dumps({"pii_units": pii_units,
+                                   "redacted_query": redacted},
+                                  ensure_ascii=False),
+                answer_type="redaction",
+            ))
+    return _shuffle_split(items, n_train, n_val, seed)
+
+
+# ---------------------------------------------------------------------------
 # 统一入口
 # ---------------------------------------------------------------------------
 
@@ -180,6 +340,9 @@ _LOADERS = {
     "math": _load_math,
     "aime": _load_aime,
     "hotpotqa": _load_hotpotqa,
+    "ifbench": _load_ifbench,
+    "livebench": _load_livebench,
+    "pupa": _load_pupa,
 }
 
 
@@ -187,7 +350,7 @@ def load(dataset: str, n_train: int = 50, n_val: int = 30, seed: int = 42,
          gepa_split: bool = False):
     """加载指定数据集，返回 (train, val): tuple[list[TrainSample], list[TrainSample]]。
 
-    dataset: gsm8k / math / aime / hotpotqa
+    dataset: gsm8k / math / aime / hotpotqa / ifbench / livebench / pupa
 
     gepa_split: 仅 aime 生效，完全复刻 GEPA init_dataset() 划分（seed=0 + 对半切 + ### 前缀）。
     """

@@ -433,6 +433,52 @@ DATASET_FORMAT_INSTRUCTIONS = {
         "The answer should be a concise entity name or short phrase (a few words), "
         "as it would appear in a reading-comprehension answer span."
     ),
+    # 可验证指令跟随（IFBench / LiveBench）：约束写在 prompt 里，需产出满足
+    # 全部约束的【完整回答】；判分对整段回答逐约束校验，无单独答案标记。
+    "ifbench": (
+        "You will receive an instruction that contains one or more specific, "
+        "verifiable constraints (for example: required/forbidden keywords, exact "
+        "word or sentence counts, paragraph or section structure, bullet/list "
+        "formatting, casing, punctuation, or special output templates).\n"
+        "Follow EVERY constraint exactly and simultaneously. Satisfy the content "
+        "of the instruction AND all stated constraints.\n"
+        "Respond with only the content that fulfills the instruction — do NOT add "
+        "prefaces, explanations, or any meta-commentary about the constraints, "
+        "as extra text may violate length/format constraints."
+    ),
+    "livebench": (
+        "You will receive an instruction that contains one or more specific, "
+        "verifiable constraints (for example: required/forbidden keywords, exact "
+        "word/sentence/paragraph counts, section or title formatting, bullet "
+        "lists, JSON output, ending phrases, or quotation wrapping).\n"
+        "Follow EVERY constraint exactly and simultaneously. Satisfy the content "
+        "of the instruction AND all stated constraints.\n"
+        "Respond with only the content that fulfills the instruction — do NOT add "
+        "prefaces, explanations, or any meta-commentary about the constraints."
+    ),
+    # PUPA 隐私脱敏：把含 PII 的 query 改写为脱敏版，PII 一律替换为 [REDACTED]，
+    # 其余（意图、结构、非隐私措辞）保持不变；只输出脱敏后的 query。
+    "pupa": (
+        "You are a privacy-preserving query rewriter. The user query contains "
+        "personally identifiable information (PII) such as names, email addresses, "
+        "phone numbers, physical addresses, organization names, or URLs.\n"
+        "Rewrite the query so that EVERY piece of PII is replaced with the literal "
+        "token [REDACTED], while keeping the rest of the request — its intent, "
+        "structure, and all non-private wording — unchanged.\n"
+        "Output ONLY the redacted query itself, with no explanations or preamble."
+    ),
+}
+
+# 每个数据集的答案类型（决定 _parse_output 是否抽取答案、走哪条判分路径）。
+# verifiable / redaction 两类不做答案抽取——直接把完整回答交给对应 judger。
+DATASET_ANSWER_TYPES = {
+    "gsm8k": "numeric",
+    "math": "numeric",
+    "aime": "numeric",
+    "hotpotqa": "freeform",
+    "ifbench": "verifiable",
+    "livebench": "verifiable",
+    "pupa": "redaction",
 }
 
 
@@ -461,6 +507,10 @@ class TaskLM:
         # 当前数据集的输出格式指令（由 engine.set_dataset 注入）。
         # 为空字符串时退化为通用模板，保证 demo/无数据集场景可用。
         self.dataset_format: str = ""
+        # 当前数据集的答案类型（由 engine.set_dataset 注入）。run() 未显式传
+        # answer_type 时用它兜底——使 inference() 等省略 answer_type 的路径
+        # 也能对 verifiable/redaction 走"判完整回答"而非答案抽取。
+        self.dataset_answer_type: str = "exact"
 
     def _call_llm(self, system: str, user: str) -> str:
         """真实模型调用。无 key 时由 _OpenAIClient 自动回退占位。"""
@@ -478,14 +528,18 @@ class TaskLM:
         problem: str,
         context_examples: Optional[list[Example]] = None,
         gold_answer: Optional[str] = None,
-        answer_type: str = "exact",
+        answer_type: Optional[str] = None,
     ) -> Trace:
         """在策略 + 检索到的短期规律下执行题目。
 
         context_examples: 命中的短期规律（few-shot 上下文）。
         gold_answer:      标准答案；提供则据 answer_type 判对错。
-        answer_type:      exact / numeric / freeform。
+        answer_type:      exact / numeric / freeform / verifiable / redaction。
+                          None 时回退到 self.dataset_answer_type（set_dataset 注入），
+                          使省略该参数的调用路径也能匹配当前数据集的判分方式。
         """
+        if answer_type is None:
+            answer_type = self.dataset_answer_type
         few_shot = "\n".join(e.to_prompt_str() for e in (context_examples or []))
         system_prompt = self._assemble_system_prompt(few_shot)
         # 记录附加上下文，供反思分析
@@ -674,14 +728,40 @@ class TaskLM:
                       answer_type: str) -> tuple[str, bool]:
         """抽取答案并据 gold_answer 判对错。无 gold_answer 时默认错。
 
-        优先用注入的 judger（数据集专用判分）；否则回退内置 is_correct。
+        answer_type ∈ {verifiable, redaction} 时【不做答案抽取】：这类任务对
+        模型的完整回答判分（逐约束校验 / PII 泄漏检查），抽取短答案会破坏
+        约束验证。此时 answer 即完整 raw，直接交给 judger。
+
+        其余类型：抽取答案后，优先用注入的 judger，否则回退内置 is_correct。
+        judger 抛 ImportError 时向上冒泡（缺依赖须显式暴露，不能被当成"答错"
+        静默吞掉）；其它异常保守判 False。
         """
+        # verifiable / redaction：判完整回答，不抽取
+        if answer_type in ("verifiable", "redaction"):
+            answer = (raw or "").strip()        # 存储/展示用（strip 后）
+            if gold_answer is None:
+                return answer, False
+            if self.judger is not None:
+                try:
+                    # 判分传【未 strip】的完整 raw：官方 IFBench strict 语义下
+                    # check_following 收到原始回答（no_whitespace / end_checker
+                    # 等约束对首尾空白敏感）；judger 内部自行做空白门槛。
+                    return answer, bool(self.judger(raw or "", gold_answer))
+                except ImportError:
+                    raise                       # 缺依赖/环境：显式暴露，勿判 False
+                except Exception:
+                    return answer, False
+            # 无 judger 时无法验证结构化约束，判 False
+            return answer, False
+
         answer = self.extract_answer(raw)
         if gold_answer is None:
             return answer, False
         if self.judger is not None:
             try:
                 return answer, bool(self.judger(answer, gold_answer))
+            except ImportError:
+                raise
             except Exception:
                 return answer, False
         return answer, self.is_correct(answer, gold_answer, answer_type)

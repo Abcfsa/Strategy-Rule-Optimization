@@ -1,0 +1,19 @@
+# Extra dependencies for IFBench / LiveBench verifiable instruction-following
+# evaluation (sro/ifbench_verifier/, vendored from allenai/IFBench, Apache-2.0).
+#
+# Only needed when running `--dataset ifbench` or `--dataset livebench`.
+# GSM8K / MATH / AIME / HotpotQA / PUPA do NOT require these.
+#
+# Reading the IFBench / LiveBench parquet files additionally needs a parquet
+# reader — either `datasets` or `pyarrow` (see sro/datasets.py::_read_parquet_rows):
+#     pip install datasets      # or: pip install pyarrow
+#
+# On first import the vendored instructions_util runs nltk.download() for
+# punkt / punkt_tab / stopwords / averaged_perceptron_tagger_eng (network).
+# If the run environment is offline, pre-fetch them once on a networked host:
+#     python -c "import nltk; [nltk.download(p) for p in ('punkt','punkt_tab','stopwords','averaged_perceptron_tagger_eng')]"
+nltk>=3.8
+langdetect>=1.0.9
+emoji>=2.8.0
+syllapy>=0.7.1
+immutabledict>=3.0.0
