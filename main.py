@@ -294,10 +294,11 @@ def main() -> None:
                         default=None,
                         help="short-term pattern generation mode: basic=max 6 patterns/reflect (default from .env), "
                              "rich=multi-angle extraction + error clustering (~6x more patterns, ~6x reflection cost)")
-    parser.add_argument("--test-match-method", choices=["vector", "llm"],
+    parser.add_argument("--test-match-method", choices=["vector", "llm", "random"],
                         default=None,
                         help="test-time pattern matching: vector=cosine only (default from .env), "
-                             "llm=vector recall + LLM applicability judge (retrieve-then-rerank, +1 LLM call per test question)")
+                             "llm=vector recall + LLM applicability judge (retrieve-then-rerank, +1 LLM call per test question), "
+                             "random=vector recall top-N + random k (no applicability judge; ablation)")
     parser.add_argument("--reflect-wrong-only", action="store_true",
                         default=None,
                         help="STEVE-style error-driven reflection: extract lessons/diagnostics ONLY from "

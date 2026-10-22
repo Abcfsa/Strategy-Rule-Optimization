@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import random
 from typing import Optional
 
 from .llm import (
@@ -62,7 +63,7 @@ class SROEngine:
         seed: int = 42,
         pattern_gen_mode: Optional[str] = None,   # None=读 .env；basic/rich
         pattern_dedup_threshold: Optional[float] = None,  # None=读 .env
-        test_match_method: Optional[str] = None,  # None=读 .env；vector/llm
+        test_match_method: Optional[str] = None,  # None=读 .env；vector/llm/random
         reflect_wrong_only: Optional[bool] = None,  # None=读 .env；STEVE式错误驱动
         regularized_verify: Optional[bool] = None,  # None=读 .env；STEVE正则化验证门控
         npo_window: Optional[int] = None,           # None=读 .env；NPO滑动窗口W
@@ -88,11 +89,14 @@ class SROEngine:
         self.npo_window = (cfg.npo_window if npo_window is None
                            else max(1, int(npo_window)))
         self.test_match_method = (test_match_method or cfg.test_match_method).lower()
-        if self.test_match_method not in ("vector", "llm"):
+        if self.test_match_method not in ("vector", "llm", "random"):
             raise ValueError(
                 f"unknown test_match_method {self.test_match_method!r}; "
-                f"choose 'vector' or 'llm'")
+                f"choose 'vector', 'llm' or 'random'")
         self.llm_match_recall_k = cfg.llm_match_recall_k
+        self.random_match_recall_n = cfg.random_match_recall_n
+        # random 模式的抽样 rng：用 seed 派生，保证同 seed 可复现
+        self._random_match_rng = random.Random(seed)
         self.match_threshold = match_threshold
         self.top_k = top_k
         self.dynamic_learning = dynamic_learning
@@ -669,6 +673,22 @@ class SROEngine:
         # 按 LLM 选中下标取规律，保持粗召回的相似度序，最多 top_k 条
         return [candidates[i] for i in indices[: self.top_k]]
 
+    def _random_match(self, question: str) -> list:
+        """random 匹配（消融用）：向量粗召回 top-random_match_recall_n →
+        无任何适用性判据，从中随机抽 top_k 条。
+
+        与 llm 模式相同的粗召回（threshold=-1.0，不做质量过滤），区别只在
+        第二阶段：llm 用 judge 精选，random 用无放回随机抽样。
+        用于回答"命中收益来自 LLM 判适用性，还是仅仅来自注入了 pattern"。
+        抽样用 self._random_match_rng（seed 派生），同 seed 同题库顺序可复现。
+        """
+        candidates = self.kb.retrieve(question, k=self.random_match_recall_n,
+                                      threshold=-1.0)
+        if not candidates:
+            return []
+        k = min(self.top_k, len(candidates))
+        return self._random_match_rng.sample(candidates, k)
+
     def inference(self, question: str, verbose: bool = False) -> tuple[str, dict]:
         """测试推理，含命中/不匹配两条分支。
 
@@ -679,6 +699,8 @@ class SROEngine:
         if self.test_use_patterns:
             if self.test_match_method == "llm":
                 hits = self._llm_match(question)
+            elif self.test_match_method == "random":
+                hits = self._random_match(question)
             else:
                 hits = self.kb.retrieve(question, k=self.top_k,
                                         threshold=self.match_threshold)

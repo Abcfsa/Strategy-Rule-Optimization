@@ -62,7 +62,9 @@ DEFAULTS = {
     "REGULARIZED_VERIFY": "false",  # true=GEPA候选接受前加保留集回归门控(λ_t=1.5+0.1(t-1))
     # ---- 测试时匹配方法 ----
     "TEST_MATCH_METHOD": "vector",  # vector=纯cosine(现状) / llm=向量粗召回+LLM精选(retrieve-then-rerank)
+                                    # / random=向量粗召回 top-N 后无判据随机抽 k 条（消融用）
     "LLM_MATCH_RECALL_K": "10",     # llm 模式：向量粗召回的候选数（LLM 从中判断哪些真正适用）
+    "RANDOM_MATCH_RECALL_N": "10",  # random 模式：粗召回候选数 N（从中随机抽 TOP_K 条注入）
     "MATCH_JUDGE_MODEL": "",        # llm 精选用的模型；空=继承 REFLECTION_MODEL
     # ---- 检索 / 匹配 ----
     "EMBED_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
@@ -127,6 +129,7 @@ class Config:
     # 测试时匹配方法
     test_match_method: str
     llm_match_recall_k: int
+    random_match_recall_n: int
     match_judge_model: str
     embed_model: str
     embed_dim: int
@@ -184,6 +187,7 @@ class Config:
             regularized_verify=_parse_bool(g("REGULARIZED_VERIFY")),
             test_match_method=g("TEST_MATCH_METHOD"),
             llm_match_recall_k=int(g("LLM_MATCH_RECALL_K")),
+            random_match_recall_n=int(g("RANDOM_MATCH_RECALL_N")),
             match_judge_model=g("MATCH_JUDGE_MODEL"),
             embed_model=g("EMBED_MODEL"),
             embed_dim=int(g("EMBED_DIM")),
