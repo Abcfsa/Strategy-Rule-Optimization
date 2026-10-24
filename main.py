@@ -157,6 +157,7 @@ def run_dataset(
     aime_gepa_split: bool = False, pattern_gen_mode: str | None = None,
     test_match_method: str | None = None, reflect_wrong_only: bool | None = None,
     regularized_verify: bool | None = None, npo_window: int | None = None,
+    cross_aware_gen: bool | None = None,
     skip_initial_baseline: bool = False,
 ) -> None:
     """Load a real dataset and run the two-phase loop, then save outputs.
@@ -187,6 +188,7 @@ def run_dataset(
         reflect_wrong_only=reflect_wrong_only,
         regularized_verify=regularized_verify,
         npo_window=npo_window,
+        cross_aware_gen=cross_aware_gen,
     )
     engine.set_dataset(dataset, gepa_split=aime_gepa_split)   # inject the matching grader
 
@@ -237,6 +239,7 @@ def run_dataset(
         "reflect_wrong_only": engine.reflect_wrong_only,
         "regularized_verify": engine.regularized_verify,
         "npo_window": engine.npo_window,
+        "cross_aware_gen": engine.cross_aware_gen,
     }
     if output_dir is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -309,6 +312,16 @@ def main() -> None:
                              "set (initial-correct val samples), rejecting updates whose minibatch gain "
                              "is outweighed by lambda_t * preservation regressions, lambda_t=1.5+0.1t "
                              "(default from .env: REGULARIZED_VERIFY; GEPA mode only)")
+    parser.add_argument("--cross-aware-gen", action="store_true",
+                        default=None,
+                        help="cross-aware generation: pattern-extraction prompts see the current "
+                             "long-term strategy, strategy-reflection prompts see existing KB "
+                             "patterns; each side is told what the other already covers, so "
+                             "patterns stay instance-level and strategy stays methodology-level "
+                             "(avoid content overlap) (default from .env: CROSS_AWARE_GEN)")
+    parser.add_argument("--no-cross-aware-gen", dest="cross_aware_gen",
+                        action="store_false",
+                        help="disable cross-aware generation (independent reflection prompts)")
     parser.add_argument("--skip-initial-baseline", action="store_true",
                         help="skip the Phase 0 initial-prompt baseline on val "
                              "(saves |val| extra LLM calls; summary fields become null)")
@@ -325,6 +338,7 @@ def main() -> None:
                     args.aime_gepa_split, args.pattern_gen_mode,
                     args.test_match_method, args.reflect_wrong_only,
                     args.regularized_verify, args.npo_window,
+                    args.cross_aware_gen,
                     args.skip_initial_baseline)
     else:
         parser.print_help()
