@@ -539,9 +539,35 @@ class TaskLM:
           6. 文本中最后一个数字（兜底）
         规则 1-5 按出现位置竞争；都找不到则走 6；再找不到返回去掉首尾
         空白的原文。
+
+        另有一条高优先规则（"规则 0"）：占位符回显——模型把格式指令里
+        的 '### <final answer>' 当标题原样照抄、真答案写在下一行
+        （qwen 系模型实测形态）。该标记出现即视为终答，取其后首个非空行。
         """
         import re
         candidates: list[tuple[int, str]] = []   # (标记起始位置, 抽取值)
+
+        # 0) 占位符回显："### <final answer>" 原样照抄、真答案在其后
+        #    （同行，或下一非空行——跳过 markdown 标题行）。取最后一个。
+        m = None
+        for m in re.finditer(r"#{1,4}\s*<final answer>", raw, re.IGNORECASE):
+            pass
+        if m:
+            rest = raw[m.end():]
+            same_line = rest.split("\n", 1)[0].strip()
+            if same_line:
+                val = same_line
+            else:
+                val = ""
+                for line in rest.split("\n")[1:]:
+                    ls = line.strip()
+                    if ls and not ls.startswith("#"):
+                        val = ls
+                        break
+            # 剥 markdown 引用/加粗装饰（"> 72"）；空值/纯标点不记
+            val = val.lstrip(">#* \t")
+            if val and re.search(r"[0-9A-Za-z]", val):
+                candidates.append((m.end(), val))
 
         # 1) \boxed{...}（取最后一个；花括号配对，支持嵌套）
         last = raw.rfind("\\boxed")
@@ -579,7 +605,13 @@ class TaskLM:
         ):
             pass
         if m and m.group(1).strip():
-            candidates.append((m.start(), m.group(1).strip()))
+            val = m.group(1).strip()
+            # 剥 markdown 引用/加粗装饰（"> 4" 会让 re.match 类 judger
+            # 假阴性），再拒收纯标点捕获（'>' / '**'——last-marker-wins
+            # 会让它们压过规则 2/0 的真答案）
+            val = val.lstrip(">#* \t")
+            if val and re.search(r"[0-9A-Za-z]", val):
+                candidates.append((m.start(), val))
 
         # 4) <answer>X</answer> 标签（取最后一个）
         m = None
@@ -725,7 +757,8 @@ class ReflectionLM:
 
     def __init__(self, embedder: Optional[Embedder] = None,
                  pattern_gen_mode: Optional[str] = None,
-                 reflect_wrong_only: Optional[bool] = None) -> None:
+                 reflect_wrong_only: Optional[bool] = None,
+                 cross_aware_gen: Optional[bool] = None) -> None:
         cfg = get_config()
         self.model = cfg.reflection_model
         self.timeout = cfg.reflection_timeout
@@ -750,6 +783,13 @@ class ReflectionLM:
         self.reflect_wrong_only = (cfg.reflect_wrong_only
                                    if reflect_wrong_only is None
                                    else bool(reflect_wrong_only))
+        # 跨感知生成（cross-aware generation）：反思时互相注入对方当前状态——
+        #   pattern 提示看当前长期策略（被告知"方法论归策略，你只写实例级规律"）
+        #   strategy 提示看 KB 已有规律（被告知"实例级规律已由 KB 覆盖，你只写方法论"）
+        # 目的：避免两类知识重复覆盖同一内容。显式传入优先，否则读 .env
+        self.cross_aware_gen = (cfg.cross_aware_gen
+                                if cross_aware_gen is None
+                                else bool(cross_aware_gen))
 
     def _call_llm(self, system: str, user: str,
                   model: Optional[str] = None) -> str:
@@ -839,22 +879,69 @@ class ReflectionLM:
         return "\n".join(summary_lines)
 
     # ---- 阶段一：批量反思 ----
-    def reflect(self, traces: list[Trace]) -> tuple[list[Example], Strategy]:
+    def reflect(self, traces: list[Trace],
+                strategy_text: Optional[str] = None,
+                kb_patterns: Optional[list[str]] = None,
+                ) -> tuple[list[Example], Strategy]:
         """分析一批轨迹，产出短期规律 + 长期策略。按 pattern_gen_mode 分发。
 
         basic: 每批最多 6 条（wrong[:3]+correct[:3] 各 1 角度），轨迹截 200 字符。
         rich:  每批最多 ~35 条（wrong/correct 各至多 pattern_max_traces 条 × 2 角度
                + 错误聚类至多 3 条），轨迹截 2000 字符。
 
+        cross_aware_gen=True 时调用方应传入 strategy_text（当前长期策略）
+        与 kb_patterns（KB 已有规律文本），反思提示据此互斥分工、避免重复。
+
         返回:
             short_patterns: 特定例子/短期规律（带 embedding）
             long_strategy:  长期策略（System Prompt 级方法论）
         """
         if self.pattern_gen_mode == "rich":
-            return self._reflect_rich(traces)
-        return self._reflect_basic(traces)
+            return self._reflect_rich(traces, strategy_text, kb_patterns)
+        return self._reflect_basic(traces, strategy_text, kb_patterns)
 
-    def _reflect_basic(self, traces: list[Trace]) -> tuple[list[Example], Strategy]:
+    # ---- cross_aware_gen 辅助：互斥分工提示片段 ----
+    def _pattern_awareness_note(self, strategy_text: Optional[str]) -> str:
+        """pattern 提示的注入片段：展示当前策略，约束 pattern 只写实例级内容。"""
+        if not self.cross_aware_gen:
+            return ""
+        strategy_text = (strategy_text or "").strip() or "(empty - no strategy yet)"
+        return (
+            f"\n\n[Context - current long-term strategy the solver already follows]\n"
+            f"{strategy_text}\n"
+            f"[Constraint] The strategy above already covers methodology-level "
+            f"advice. Do NOT restate it. Write ONLY instance-level lessons: "
+            f"concrete pitfalls or practices tied to THIS problem's specifics "
+            f"(numbers, structure, trick). If your lesson could be moved into "
+            f"the strategy without losing information, it is too general - "
+            f"discard it and extract a more specific one."
+        )
+
+    def _strategy_awareness_note(self, kb_patterns: Optional[list[str]]) -> str:
+        """strategy 提示的注入片段：展示 KB 已有规律，约束策略只写方法论。"""
+        if not self.cross_aware_gen:
+            return ""
+        if kb_patterns:
+            listing = "\n".join(f"- {p[:120]}" for p in kb_patterns[:15])
+            covered = (f"The knowledge base already stores these instance-level "
+                       f"lessons:\n{listing}")
+        else:
+            covered = ("The knowledge base currently stores no instance-level "
+                       "lessons.")
+        return (
+            f"\n\n[Context - {covered}]\n"
+            f"[Constraint] Instance-level lessons are already covered by the "
+            f"knowledge base above and will be injected per-problem at solve "
+            f"time. Do NOT restate them. Summarize ONLY methodology-level "
+            f"strategy: general reasoning principles, planning and verification "
+            f"habits that apply across problems, independent of any specific "
+            f"problem's features."
+        )
+
+    def _reflect_basic(self, traces: list[Trace],
+                       strategy_text: Optional[str] = None,
+                       kb_patterns: Optional[list[str]] = None,
+                       ) -> tuple[list[Example], Strategy]:
         """basic 模式：原有逻辑，每批最多 6 条规律。"""
         correct = [t for t in traces if t.result.correct]
         wrong = [t for t in traces if not t.result.correct]
@@ -863,25 +950,27 @@ class ReflectionLM:
         c = _get_client()
 
         patterns: list[Example] = []
+        pattern_note = self._pattern_awareness_note(strategy_text)
+        strategy_note = self._strategy_awareness_note(kb_patterns)
         if c.is_real:
             # 短期规律：让 LLM 从错题/对题中提炼要点
             for t in wrong[:3]:
                 sys = "You are an experience distillation assistant. Extract one reusable pitfall-avoidance lesson from this failed trajectory (one sentence)."
-                usr = f"Problem:\n{t.problem}\nWrong answer:\n{t.result.answer}\nTrajectory excerpt:\n{t.trajectory[:200]}"
+                usr = f"Problem:\n{t.problem}\nWrong answer:\n{t.result.answer}\nTrajectory excerpt:\n{t.trajectory[:200]}{pattern_note}"
                 text = self._call_llm(sys, usr)
                 p = Example(text=text, source_run_id=t.run_id, polarity=-1)
                 p.embedding = self.embedder.embed(text)
                 patterns.append(p)
             for t in correct[:3]:
                 sys = "You are an experience distillation assistant. Extract one reusable effective practice from this correct trajectory (one sentence)."
-                usr = f"Problem:\n{t.problem}\nTrajectory excerpt:\n{t.trajectory[:200]}"
+                usr = f"Problem:\n{t.problem}\nTrajectory excerpt:\n{t.trajectory[:200]}{pattern_note}"
                 text = self._call_llm(sys, usr)
                 p = Example(text=text, source_run_id=t.run_id, polarity=+1)
                 p.embedding = self.embedder.embed(text)
                 patterns.append(p)
             # 长期策略
             sys = "You are a meta-learning methodology expert. Summarize a general problem-solving strategy."
-            usr = f"Summarize the common lessons from these {len(traces)} trajectories."
+            usr = f"Summarize the common lessons from these {len(traces)} trajectories.{strategy_note}"
             long_text = self._call_llm(sys, usr)
         else:
             # 占位逻辑（无 key）
@@ -907,7 +996,10 @@ class ReflectionLM:
         long_strategy = Strategy(text=long_text, version=1)
         return patterns, long_strategy
 
-    def _reflect_rich(self, traces: list[Trace]) -> tuple[list[Example], Strategy]:
+    def _reflect_rich(self, traces: list[Trace],
+                      strategy_text: Optional[str] = None,
+                      kb_patterns: Optional[list[str]] = None,
+                      ) -> tuple[list[Example], Strategy]:
         """rich 模式：多角度提取 + 错误聚类，产量约为 basic 的 6 倍。
 
         每条 wrong trace 产 2 条规律：
@@ -928,6 +1020,8 @@ class ReflectionLM:
         c = _get_client()
 
         patterns: list[Example] = []
+        pattern_note = self._pattern_awareness_note(strategy_text)
+        strategy_note = self._strategy_awareness_note(kb_patterns)
 
         def _add(text: str, run_id: str, polarity: int) -> None:
             text = (text or "").strip()
@@ -949,13 +1043,13 @@ class ReflectionLM:
                 usr1 = (f"Problem:\n{t.problem}\n"
                         f"Model's answer: {t.result.answer}\n"
                         f"Correct answer: {gold}\n"
-                        f"Full reasoning:\n{t.trajectory[:2000]}")
+                        f"Full reasoning:\n{t.trajectory[:2000]}{pattern_note}")
                 _add(self._call_llm(sys1, usr1), t.run_id, -1)
                 # 角度2：避坑教训（与 basic 同角度，但轨迹更长）
                 sys2 = ("You are an experience distillation assistant. Extract one reusable "
                         "pitfall-avoidance lesson from this failed trajectory (one sentence).")
                 usr2 = (f"Problem:\n{t.problem}\nWrong answer:\n{t.result.answer}\n"
-                        f"Trajectory excerpt:\n{t.trajectory[:2000]}")
+                        f"Trajectory excerpt:\n{t.trajectory[:2000]}{pattern_note}")
                 _add(self._call_llm(sys2, usr2), t.run_id, -1)
 
             # ---- b) correct traces × 2 角度 ----
@@ -964,7 +1058,7 @@ class ReflectionLM:
                 sys3 = ("You are an experience distillation assistant. Extract one reusable "
                         "effective practice from this correct trajectory (one sentence).")
                 usr3 = (f"Problem:\n{t.problem}\n"
-                        f"Trajectory excerpt:\n{t.trajectory[:2000]}")
+                        f"Trajectory excerpt:\n{t.trajectory[:2000]}{pattern_note}")
                 _add(self._call_llm(sys3, usr3), t.run_id, +1)
                 # 角度2：触发规则（题目特征 → 技巧）
                 sys4 = ("You are an experience distillation assistant. From this correct "
@@ -973,7 +1067,7 @@ class ReflectionLM:
                         "Keep it to one sentence and make the feature X concrete "
                         "(problem-type keywords, given conditions, or structure).")
                 usr4 = (f"Problem:\n{t.problem}\n"
-                        f"Trajectory excerpt:\n{t.trajectory[:2000]}")
+                        f"Trajectory excerpt:\n{t.trajectory[:2000]}{pattern_note}")
                 _add(self._call_llm(sys4, usr4), t.run_id, +1)
 
             # ---- c) batch 级错误聚类（至多 3 条）----
@@ -990,7 +1084,7 @@ class ReflectionLM:
                         "2+ problems output one reusable lesson starting with "
                         "'Problems involving ...'. Output at most 3 lessons, "
                         "one per line, no numbering.")
-                cluster_text = self._call_llm(sys5, digest)
+                cluster_text = self._call_llm(sys5, digest + pattern_note)
                 for line in (cluster_text or "").split("\n"):
                     line = line.strip(" -*\t")
                     if len(line) >= 20:  # 过滤空行/碎行
@@ -1000,7 +1094,7 @@ class ReflectionLM:
 
             # ---- 长期策略（与 basic 相同）----
             sys6 = "You are a meta-learning methodology expert. Summarize a general problem-solving strategy."
-            usr6 = f"Summarize the common lessons from these {len(traces)} trajectories."
+            usr6 = f"Summarize the common lessons from these {len(traces)} trajectories.{strategy_note}"
             long_text = self._call_llm(sys6, usr6)
         else:
             # 占位逻辑（无 key）：模拟 rich 的产量结构
@@ -1099,12 +1193,16 @@ class ReflectionLM:
 
     # ---- GEPA 反思：生成新策略 ----
     def reflect_gepa(self, parent: Strategy, minibatch_traces: list[Trace],
-                     iteration: int) -> str:
+                     iteration: int,
+                     kb_patterns: Optional[list[str]] = None) -> str:
         """GEPA-style reflection: diagnostic feedback + error clustering -> new strategy text.
 
         Returns new prompt text (complete replacement). Caller cleans markdown
         fences and validates length. Uses v3's build_reflection_prompt structure
         but generalizes 'AIME' to 'the task' for multi-dataset support.
+
+        cross_aware_gen=True 时调用方应传入 kb_patterns（KB 已有规律文本），
+        新策略提示据此避免与 KB 规律重复（方法论/实例级分工）。
         """
         detailed_traces = self._build_diagnostic_feedback(minibatch_traces)
         error_summary = self._cluster_error_patterns(minibatch_traces)
@@ -1130,12 +1228,14 @@ class ReflectionLM:
             f"Provide the new instruction within ``` blocks.\n"
             f"The new instruction must be a complete replacement (not a diff or patch).\n"
             f"Do NOT include explanations — only the new instruction."
+            f"{self._strategy_awareness_note(kb_patterns)}"
         )
         sys = ("You are an expert prompt engineer. Return ONLY the new instruction text.")
         return self._call_llm(system=sys, user=reflection_prompt)
 
     # ---- NPO：滑动窗口教师反思 ----
-    def reflect_npo(self, window: list) -> str:
+    def reflect_npo(self, window: list,
+                    kb_patterns: Optional[list[str]] = None) -> str:
         """NPO teacher revision (arXiv:2608.27266 Algorithm 1, step 6).
 
         window: list of (Strategy, list[Trace], val_score) tuples, oldest first
@@ -1148,6 +1248,9 @@ class ReflectionLM:
         to keep the teacher context bounded; the remaining examples are
         summarized by counts. reflect_wrong_only filtering applies through
         _build_diagnostic_feedback (orthogonal mechanism).
+
+        cross_aware_gen=True 时调用方应传入 kb_patterns（KB 已有规律文本），
+        教师提示据此避免与 KB 规律重复（方法论/实例级分工）。
         """
         sections = []
         for v, (strategy, traces, val_score) in enumerate(window, start=1):
@@ -1183,6 +1286,7 @@ class ReflectionLM:
             f"Provide the new instruction within ``` blocks.\n"
             f"The new instruction must be a complete replacement (not a diff "
             f"or patch). Do NOT include explanations — only the new instruction."
+            f"{self._strategy_awareness_note(kb_patterns)}"
         )
         sys = ("You are an expert prompt engineer. Return ONLY the new instruction text.")
         return self._call_llm(system=sys, user=teacher_prompt)
