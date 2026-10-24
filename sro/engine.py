@@ -65,6 +65,7 @@ class SROEngine:
         pattern_dedup_threshold: Optional[float] = None,  # None=读 .env
         test_match_method: Optional[str] = None,  # None=读 .env；vector/llm/random
         reflect_wrong_only: Optional[bool] = None,  # None=读 .env；STEVE式错误驱动
+        cross_aware_gen: Optional[bool] = None,  # None=读 .env；跨感知生成
         regularized_verify: Optional[bool] = None,  # None=读 .env；STEVE正则化验证门控
         npo_window: Optional[int] = None,           # None=读 .env；NPO滑动窗口W
     ) -> None:
@@ -74,12 +75,14 @@ class SROEngine:
         self.task_lm = task_lm or TaskLM(self.embedder)
         self.reflection_lm = reflection_lm or ReflectionLM(
             self.embedder, pattern_gen_mode=pattern_gen_mode,
-            reflect_wrong_only=reflect_wrong_only)
+            reflect_wrong_only=reflect_wrong_only,
+            cross_aware_gen=cross_aware_gen)
         dedup = (cfg.pattern_dedup_threshold
                  if pattern_dedup_threshold is None else pattern_dedup_threshold)
         self.kb = kb or KnowledgeBase(self.embedder, dedup_threshold=dedup)
         self.pattern_gen_mode = self.reflection_lm.pattern_gen_mode
         self.reflect_wrong_only = self.reflection_lm.reflect_wrong_only
+        self.cross_aware_gen = self.reflection_lm.cross_aware_gen
         # STEVE 正则化验证门控（仅 gepa 模式生效；npo 模式下警告并忽略——
         # NPO 的哲学是无接受门控、无条件进链，加门控就不是 NPO 了）
         self.regularized_verify = (cfg.regularized_verify
@@ -107,6 +110,10 @@ class SROEngine:
         self.minibatch_size = minibatch_size
         self.max_prompt_length = max_prompt_length
         self.seed = seed
+
+    def _kb_pattern_texts(self) -> list[str]:
+        """KB 已有规律文本列表（cross_aware_gen 注入用；关闭时调用方不传）。"""
+        return [e.text for e in self.kb.examples if e.permanent]
 
     def set_dataset(self, dataset: str, gepa_split: bool = False) -> None:
         """绑定数据集：把对应 evaluate_answer 注入 TaskLM.judger，
@@ -172,7 +179,13 @@ class SROEngine:
                 )
                 traces.append(trace)
 
-            short_patterns, long_strategy = self.reflection_lm.reflect(traces)
+            short_patterns, long_strategy = self.reflection_lm.reflect(
+                traces,
+                strategy_text=(self.task_lm.strategy.text
+                               if self.cross_aware_gen else None),
+                kb_patterns=(self._kb_pattern_texts()
+                             if self.cross_aware_gen else None),
+            )
 
             patterns_before = len(self.kb.examples)
             self.kb.add_patterns(short_patterns)
@@ -386,7 +399,9 @@ class SROEngine:
 
                 # 2d) reflection -> new strategy text
                 new_text = self.reflection_lm.reflect_gepa(
-                    parent, old_traces, iteration)
+                    parent, old_traces, iteration,
+                    kb_patterns=(self._kb_pattern_texts()
+                                 if self.cross_aware_gen else None))
                 new_text = _clean_markdown(new_text)
                 if not new_text or new_text == parent.text:
                     if verbose:
@@ -460,7 +475,12 @@ class SROEngine:
 
                 # 2h) short patterns from reflection -> KB (coexistence)
                 patterns, _ = self.reflection_lm.reflect(
-                    old_traces + new_traces)
+                    old_traces + new_traces,
+                    strategy_text=(new_strat.text
+                                   if self.cross_aware_gen else None),
+                    kb_patterns=(self._kb_pattern_texts()
+                                 if self.cross_aware_gen else None),
+                )
                 self.kb.add_patterns(patterns)
 
                 history.append({
@@ -565,7 +585,10 @@ class SROEngine:
                           f" ({mb_size} calls)")
 
                 # 3-4) teacher revision from sliding-window feedback
-                new_text = self.reflection_lm.reflect_npo(list(window))
+                new_text = self.reflection_lm.reflect_npo(
+                    list(window),
+                    kb_patterns=(self._kb_pattern_texts()
+                                 if self.cross_aware_gen else None))
                 new_text = _clean_markdown(new_text)
                 if not new_text or new_text == current.text:
                     if verbose:
@@ -595,7 +618,13 @@ class SROEngine:
                           f" ({n_val} calls){' * new best' if is_best else ''}")
 
                 # 6) KB coexistence: short patterns from this minibatch
-                patterns, _ = self.reflection_lm.reflect(traces)
+                patterns, _ = self.reflection_lm.reflect(
+                    traces,
+                    strategy_text=(current.text
+                                   if self.cross_aware_gen else None),
+                    kb_patterns=(self._kb_pattern_texts()
+                                 if self.cross_aware_gen else None),
+                )
                 self.kb.add_patterns(patterns)
 
                 history.append({

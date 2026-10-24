@@ -58,6 +58,8 @@ DEFAULTS = {
     "PATTERN_DEDUP_THRESHOLD": "0.0",  # >0 时规律入库前与已有规律 cosine>=阈值则跳过(去重)；rich 建议 0.92
     # ---- 反思样本来源 ----
     "REFLECT_WRONG_ONLY": "false",  # true=STEVE式错误驱动：只用错误轨迹反思；false=错误+正确都用
+    # ---- 跨感知生成（反思提示互相注入对方状态）----
+    "CROSS_AWARE_GEN": "false",  # true=pattern提示看当前策略、strategy提示看KB规律（分工去重）
     # ---- STEVE 正则化验证（第二机制）----
     "REGULARIZED_VERIFY": "false",  # true=GEPA候选接受前加保留集回归门控(λ_t=1.5+0.1(t-1))
     # ---- 测试时匹配方法 ----
@@ -124,6 +126,8 @@ class Config:
     pattern_dedup_threshold: float
     # 反思样本来源
     reflect_wrong_only: bool
+    # 跨感知生成
+    cross_aware_gen: bool
     # STEVE 正则化验证门控
     regularized_verify: bool
     # 测试时匹配方法
@@ -184,6 +188,7 @@ class Config:
             pattern_max_traces=int(g("PATTERN_MAX_TRACES")),
             pattern_dedup_threshold=float(g("PATTERN_DEDUP_THRESHOLD")),
             reflect_wrong_only=_parse_bool(g("REFLECT_WRONG_ONLY")),
+            cross_aware_gen=_parse_bool(g("CROSS_AWARE_GEN")),
             regularized_verify=_parse_bool(g("REGULARIZED_VERIFY")),
             test_match_method=g("TEST_MATCH_METHOD"),
             llm_match_recall_k=int(g("LLM_MATCH_RECALL_K")),
