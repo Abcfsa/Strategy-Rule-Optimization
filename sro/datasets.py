@@ -1,18 +1,19 @@
-"""数据集加载：HotpotQA / GSM8K / MATH / AIME。
+"""数据集加载：HotpotQA / GSM8K / MATH / MATH-500 / AIME。
 
 划分方法（参考 openai_api_test 脚本，统一只用 train + val，无 test）：
     - 各数据集从其 train 池 shuffle 后切分：先取 n_val 做 val，再取 n_train 做 train
       （val 在前，train 数量变动不影响 val 集稳定性）
     - HotpotQA 用原生 train/dev 文件，dev 当 val
     - AIME 用 aimo-validation-aime 作为 train+val 池
+    - MATH-500 是纯 test 集（500 题），同走 _shuffle_split 切出 train+val
 
 判分逻辑在 sro/grading.py 内联实现（从 openai_api_test 移植的纯函数），
 SRO 自包含。答案类型：
-    gsm8k / aime / math → numeric（math 走 LaTeX 数值求值）
+    gsm8k / aime / math / math500 → numeric（math 走 LaTeX 数值求值）
     hotpotqa            → freeform（SQuAD 风格归一化匹配）
 
 数据集本地路径（相对 SRO 仓库根，可在 config 覆盖）：
-    ../gsm8k/main/   ../MATH/   ../HotpotQA/raw/   ../AIME/
+    ../gsm8k/main/   ../MATH/   ../MATH-500/   ../HotpotQA/raw/   ../AIME/
 """
 
 from __future__ import annotations
@@ -61,6 +62,7 @@ def _data_dir(name: str) -> Path:
     default = {
         "gsm8k": repo_root.parent / "gsm8k" / "main",
         "math": repo_root.parent / "MATH",
+        "math500": repo_root.parent / "MATH-500",
         "hotpotqa": repo_root.parent / "HotpotQA" / "raw",
         "aime": repo_root.parent / "AIME",
     }
@@ -101,6 +103,29 @@ def _load_math(n_train: int, n_val: int, seed: int):
         if not ans:
             continue
         items.append(TrainSample(problem=obj["problem"], answer=ans, answer_type="numeric"))
+    return _shuffle_split(items, n_train, n_val, seed)
+
+
+def _load_math500(n_train: int, n_val: int, seed: int):
+    """MATH-500：OpenAI 评测子集（test.jsonl，500 题），answer 字段直接给最终答案。
+
+    纯 test 集（无 train 标注），与 gsm8k/math 同走 _shuffle_split 从池中
+    切出 train+val 供 SRO 两阶段闭环使用。判分复用 evaluate_math（LaTeX
+    归一化 + 数值求值），与 MATH 全集同一 judger。
+    """
+    d = _data_dir("math500")
+    items: list[TrainSample] = []
+    with open(d / "test.jsonl", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            ans = (obj.get("answer") or "").strip()
+            if not obj.get("problem") or not ans:
+                continue
+            items.append(TrainSample(problem=obj["problem"], answer=ans,
+                                     answer_type="numeric"))
     return _shuffle_split(items, n_train, n_val, seed)
 
 
@@ -178,6 +203,7 @@ def _load_hotpotqa(n_train: int, n_val: int, seed: int):
 _LOADERS = {
     "gsm8k": _load_gsm8k,
     "math": _load_math,
+    "math500": _load_math500,
     "aime": _load_aime,
     "hotpotqa": _load_hotpotqa,
 }
@@ -187,7 +213,7 @@ def load(dataset: str, n_train: int = 50, n_val: int = 30, seed: int = 42,
          gepa_split: bool = False):
     """加载指定数据集，返回 (train, val): tuple[list[TrainSample], list[TrainSample]]。
 
-    dataset: gsm8k / math / aime / hotpotqa
+    dataset: gsm8k / math / math500 / aime / hotpotqa
 
     gepa_split: 仅 aime 生效，完全复刻 GEPA init_dataset() 划分（seed=0 + 对半切 + ### 前缀）。
     """

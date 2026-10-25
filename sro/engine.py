@@ -119,7 +119,7 @@ class SROEngine:
         """绑定数据集：把对应 evaluate_answer 注入 TaskLM.judger，
         并把该数据集的输出格式指令注入 TaskLM.dataset_format。
 
-        dataset: gsm8k / math / aime / hotpotqa。判分逻辑复用
+        dataset: gsm8k / math / math500 / aime / hotpotqa。判分逻辑复用
         openai_api_test 中已验证的函数，保证与基线一致。
 
         gepa_split: 仅 aime 生效，True 时用 ### 答案格式（对齐 GEPA）。

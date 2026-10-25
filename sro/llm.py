@@ -426,6 +426,13 @@ DATASET_FORMAT_INSTRUCTIONS = {
         "The boxed answer should be the final simplified result (e.g. \\boxed{90}, "
         "\\boxed{\\frac{1}{2}}, \\boxed{3\\sqrt{2}})."
     ),
+    # MATH-500：与 math 同格式（\boxed 终答；answer 字段已是最终答案串）
+    "math500": (
+        "Solve the math problem step by step.\n"
+        "At the very end, put your final answer in LaTeX as: \\boxed{<answer>}.\n"
+        "The boxed answer should be the final simplified result (e.g. \\boxed{90}, "
+        "\\boxed{\\frac{1}{2}}, \\boxed{3\\sqrt{2}})."
+    ),
     "hotpotqa": (
         "Answer the question based on the context.\n"
         "At the very end, output the final answer on its own line as:\n"

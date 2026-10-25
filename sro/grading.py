@@ -268,6 +268,8 @@ def evaluate_hotpotqa(prediction: str, ground_truth: str) -> bool:
 
 JUDGERS = {
     "math": evaluate_math,
+    # MATH-500：与 MATH 同一 judger（LaTeX 归一化 + 数值求值）
+    "math500": evaluate_math,
     "gsm8k": evaluate_gsm8k,
     "aime": evaluate_aime,
     "hotpotqa": evaluate_hotpotqa,
