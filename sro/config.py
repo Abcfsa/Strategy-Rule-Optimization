@@ -73,6 +73,7 @@ DEFAULTS = {
     "TOP_K": "3",
     "GSM8K_PATH": "",
     "MATH_PATH": "",
+    "MATH500_PATH": "",
     "HOTPOTQA_PATH": "",
     "AIME_PATH": "",
     "AIME_GEPA_SPLIT": "false",
@@ -138,6 +139,7 @@ class Config:
     top_k: int
     gsm8k_path: str = ""
     math_path: str = ""
+    math500_path: str = ""
     hotpotqa_path: str = ""
     aime_path: str = ""
     aime_gepa_split: bool = False
@@ -196,6 +198,7 @@ class Config:
             top_k=int(g("TOP_K")),
             gsm8k_path=g("GSM8K_PATH"),
             math_path=g("MATH_PATH"),
+            math500_path=g("MATH500_PATH"),
             hotpotqa_path=g("HOTPOTQA_PATH"),
             aime_path=g("AIME_PATH"),
             aime_gepa_split=_parse_bool(g("AIME_GEPA_SPLIT")),

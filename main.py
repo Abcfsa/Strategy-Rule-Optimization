@@ -3,7 +3,7 @@
 - `python main.py --demo`          : built-in placeholder demo (no API key / dataset)
 - `python main.py --dataset NAME`  : load a real dataset, run two-phase loop, save outputs
 
-Datasets: gsm8k / math / aime / hotpotqa (need local data + API key).
+Datasets: gsm8k / math / math500 / aime / hotpotqa (need local data + API key).
 
 CLI args override .env values; .env overrides built-in defaults.
 """
@@ -254,7 +254,7 @@ def main() -> None:
         description="SRO: two-phase reflective self-evolution framework",
     )
     parser.add_argument("--demo", action="store_true", help="run built-in placeholder demo")
-    parser.add_argument("--dataset", choices=["gsm8k", "math", "aime", "hotpotqa"],
+    parser.add_argument("--dataset", choices=["gsm8k", "math", "math500", "aime", "hotpotqa"],
                         help="load a real dataset and run the two-phase loop")
     # these default to .env values; CLI overrides when provided
     parser.add_argument("--n-train", type=int, default=cfg.n_train,
