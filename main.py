@@ -184,6 +184,7 @@ def run_dataset(
     test_match_method: str | None = None, reflect_wrong_only: bool | None = None,
     regularized_verify: bool | None = None, npo_window: int | None = None,
     cross_aware_gen: bool | None = None,
+    initial_prompt: str | None = None,
     test_no_pattern_rerun: bool | None = None,
     skip_initial_baseline: bool = False,
 ) -> None:
@@ -217,6 +218,7 @@ def run_dataset(
         regularized_verify=regularized_verify,
         npo_window=npo_window,
         cross_aware_gen=cross_aware_gen,
+        initial_prompt=initial_prompt,
     )
     engine.set_dataset(dataset, gepa_split=aime_gepa_split)   # inject the matching grader
 
@@ -282,6 +284,7 @@ def run_dataset(
         "regularized_verify": engine.regularized_verify,
         "npo_window": engine.npo_window,
         "cross_aware_gen": engine.cross_aware_gen,
+        "initial_prompt": engine.initial_prompt or "",
     }
     if output_dir is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -365,6 +368,13 @@ def main() -> None:
     parser.add_argument("--no-cross-aware-gen", dest="cross_aware_gen",
                         action="store_false",
                         help="disable cross-aware generation (independent reflection prompts)")
+    parser.add_argument("--initial-prompt", type=str, default=None,
+                        help="override the default starting strategy text for task_lm "
+                             "(e.g. GEPA's original INITIAL_WRITER_PROMPT); empty = per-mode "
+                             "default (classic: empty strategy, gepa/npo: generic fallback). "
+                             "Works with --cross-aware-gen: pattern-extraction prompts see this "
+                             "text as the current strategy from iteration 1 "
+                             "(default from .env: INITIAL_PROMPT)")
     parser.add_argument("--test-no-pattern-rerun", action="store_true",
                         default=None,
                         help="after the normal Phase 2 eval, re-run val once more with the SAME "
@@ -392,6 +402,7 @@ def main() -> None:
                     args.test_match_method, args.reflect_wrong_only,
                     args.regularized_verify, args.npo_window,
                     args.cross_aware_gen,
+                    args.initial_prompt,
                     args.test_no_pattern_rerun,
                     args.skip_initial_baseline)
     else:
