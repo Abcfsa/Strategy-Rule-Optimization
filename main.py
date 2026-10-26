@@ -185,6 +185,7 @@ def run_dataset(
     regularized_verify: bool | None = None, npo_window: int | None = None,
     cross_aware_gen: bool | None = None,
     initial_prompt: str | None = None,
+    minibatch_size: int | None = None,
     test_no_pattern_rerun: bool | None = None,
     skip_initial_baseline: bool = False,
 ) -> None:
@@ -210,7 +211,10 @@ def run_dataset(
         dynamic_learning=dynamic_learning,
         test_use_patterns=test_use_patterns,
         evo_mode=evo_mode, train_retrieve_ctx=train_retrieve_ctx,
-        max_metric_calls=cfg.max_metric_calls, minibatch_size=cfg.minibatch_size,
+        max_metric_calls=cfg.max_metric_calls,
+        minibatch_size=(cfg.minibatch_size
+                        if minibatch_size is None
+                        else max(1, int(minibatch_size))),
         max_prompt_length=cfg.max_prompt_length, seed=seed,
         pattern_gen_mode=pattern_gen_mode,
         test_match_method=test_match_method,
@@ -285,6 +289,7 @@ def run_dataset(
         "npo_window": engine.npo_window,
         "cross_aware_gen": engine.cross_aware_gen,
         "initial_prompt": engine.initial_prompt or "",
+        "minibatch_size": engine.minibatch_size,
     }
     if output_dir is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -329,6 +334,11 @@ def main() -> None:
                         help="NPO sliding-window size W: number of recent prompt versions the "
                              "teacher sees (default from .env: NPO_WINDOW; W=1 degrades to "
                              "memoryless single-round reflection)")
+    parser.add_argument("--minibatch-size", type=int, default=None,
+                        help="minibatch size per reflection iteration (gepa and npo modes; "
+                             "papers use 40-50 with a stronger teacher — default 8 is small, "
+                             "raise when budget allows to give the teacher richer feedback) "
+                             "(default from .env: MINIBATCH_SIZE)")
     parser.add_argument("--train-retrieve-ctx", action="store_true",
                         default=cfg.train_retrieve_ctx,
                         help="retrieve KB patterns during training (default from .env)")
@@ -403,6 +413,7 @@ def main() -> None:
                     args.regularized_verify, args.npo_window,
                     args.cross_aware_gen,
                     args.initial_prompt,
+                    args.minibatch_size,
                     args.test_no_pattern_rerun,
                     args.skip_initial_baseline)
     else:
