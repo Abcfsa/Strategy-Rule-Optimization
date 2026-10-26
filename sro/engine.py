@@ -698,6 +698,39 @@ class SROEngine:
         # 按 LLM 选中下标取规律，保持粗召回的相似度序，最多 top_k 条
         return [candidates[i] for i in indices[: self.top_k]]
 
+    def run_eval_no_patterns(self, val: list[TrainSample]) -> list[dict]:
+        """Phase 2 复测：同一 strategy，关闭 pattern 注入与动态学习硬答 val。
+
+        TEST_NO_PATTERN_RERUN 用——对照组隔离"最终成绩里 pattern 注入贡献
+        多少"。临时置 test_use_patterns/dynamic_learning 为 False（跑完恢复），
+        每题走纯 strategy 硬答，不触发 KB 检索、不归纳临时规律、
+        不产生新的 KB 写入。返回逐题记录（同 run_initial_baseline 结构）。
+        """
+        saved_use, saved_dyn = self.test_use_patterns, self.dynamic_learning
+        self.test_use_patterns, self.dynamic_learning = False, False
+        results: list[dict] = []
+        correct = 0
+        try:
+            for i, sample in enumerate(val, 1):
+                trace = self.task_lm.run(
+                    sample.problem, gold_answer=sample.answer,
+                    answer_type=sample.answer_type)
+                ok = trace.result.correct
+                correct += ok
+                results.append({
+                    "index": i,
+                    "problem": sample.problem,
+                    "prediction": trace.result.answer,
+                    "gold": sample.answer,
+                    "correct": bool(ok),
+                })
+        finally:
+            self.test_use_patterns, self.dynamic_learning = saved_use, saved_dyn
+        acc = correct / len(val) if val else 0.0
+        print(f"\n[Phase 2b] no-pattern rerun (same strategy): "
+              f"{correct}/{len(val)} = {acc:.2%}")
+        return results
+
     def inference(self, question: str, verbose: bool = False) -> tuple[str, dict]:
         """测试推理，含命中/不匹配两条分支。
 
