@@ -65,6 +65,7 @@ class SROEngine:
         test_match_method: Optional[str] = None,  # None=读 .env；vector/llm
         reflect_wrong_only: Optional[bool] = None,  # None=读 .env；STEVE式错误驱动
         cross_aware_gen: Optional[bool] = None,  # None=读 .env；跨感知生成
+        initial_prompt: Optional[str] = None,  # None=读 .env；替代默认起始 strategy 文本
         regularized_verify: Optional[bool] = None,  # None=读 .env；STEVE正则化验证门控
         npo_window: Optional[int] = None,           # None=读 .env；NPO滑动窗口W
     ) -> None:
@@ -82,6 +83,16 @@ class SROEngine:
         self.pattern_gen_mode = self.reflection_lm.pattern_gen_mode
         self.reflect_wrong_only = self.reflection_lm.reflect_wrong_only
         self.cross_aware_gen = self.reflection_lm.cross_aware_gen
+        # 初始 strategy 文本（显式传入优先，否则读 .env）。非空时替代各模式
+        # 默认起始 prompt：classic 从空 strategy 变为该文本（训练前也有方法论
+        # 可用）；gepa/npo 的候选池/链起点从 _default_prompt() 变为该文本。
+        # 注入后 Phase 0 基线、classic 反思、cross_aware_gen 的 pattern 提示
+        # （strategy_text 注入点读 task_lm.strategy.text）自动感知新起点。
+        self.initial_prompt = (cfg.initial_prompt
+                               if initial_prompt is None
+                               else str(initial_prompt).strip())
+        if self.initial_prompt:
+            self.task_lm.strategy = Strategy(text=self.initial_prompt, version=0)
         # STEVE 正则化验证门控（仅 gepa 模式生效；npo 模式下警告并忽略——
         # NPO 的哲学是无接受门控、无条件进链，加门控就不是 NPO 了）
         self.regularized_verify = (cfg.regularized_verify

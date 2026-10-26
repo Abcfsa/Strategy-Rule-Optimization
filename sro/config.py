@@ -44,6 +44,9 @@ DEFAULTS = {
     # Phase 2 复测：test_use_patterns=true 时，正常测试后用同一 strategy
     # 关掉 pattern 注入再跑一遍 val（对照"pattern 注入贡献了多少"）
     "TEST_NO_PATTERN_RERUN": "false",
+    # 初始 strategy 文本：空=各模式默认（classic 空 / gepa/npo 通用兜底）；
+    # 非空=替代默认起始 prompt（如 GEPA 原版 INITIAL_WRITER_PROMPT）
+    "INITIAL_PROMPT": "",
     # ---- 进化模式参数（classic / gepa / npo）----
     "EVO_MODE": "classic",
     "TRAIN_RETRIEVE_CTX": "true",
@@ -114,6 +117,7 @@ class Config:
     dynamic_learning: bool
     test_use_patterns: bool
     test_no_pattern_rerun: bool
+    initial_prompt: str
     evo_mode: str
     train_retrieve_ctx: bool
     max_metric_calls: int
@@ -180,6 +184,7 @@ class Config:
             dynamic_learning=_parse_bool(g("DYNAMIC_LEARNING")),
             test_use_patterns=_parse_bool(g("TEST_USE_PATTERNS")),
             test_no_pattern_rerun=_parse_bool(g("TEST_NO_PATTERN_RERUN")),
+            initial_prompt=g("INITIAL_PROMPT").strip(),
             evo_mode=g("EVO_MODE"),
             train_retrieve_ctx=_parse_bool(g("TRAIN_RETRIEVE_CTX")),
             max_metric_calls=int(g("MAX_METRIC_CALLS")),
