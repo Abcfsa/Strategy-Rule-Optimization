@@ -450,9 +450,35 @@ class TaskLM:
           6. 文本中最后一个数字（兜底）
         规则 1-5 按出现位置竞争；都找不到则走 6；再找不到返回去掉首尾
         空白的原文。
+
+        另有一条高优先规则（"规则 0"）：占位符回显——模型把格式指令里
+        的 '### <final answer>' 当标题原样照抄、真答案写在下一行
+        （qwen 系模型实测形态）。该标记出现即视为终答，取其后首个非空行。
         """
         import re
         candidates: list[tuple[int, str]] = []   # (标记起始位置, 抽取值)
+
+        # 0) 占位符回显："### <final answer>" 原样照抄、真答案在其后
+        #    （同行，或下一非空行——跳过 markdown 标题行）。取最后一个。
+        m = None
+        for m in re.finditer(r"#{1,4}\s*<final answer>", raw, re.IGNORECASE):
+            pass
+        if m:
+            rest = raw[m.end():]
+            same_line = rest.split("\n", 1)[0].strip()
+            if same_line:
+                val = same_line
+            else:
+                val = ""
+                for line in rest.split("\n")[1:]:
+                    ls = line.strip()
+                    if ls and not ls.startswith("#"):
+                        val = ls
+                        break
+            # 剥 markdown 引用/加粗装饰（"> 72"）；空值/纯标点不记
+            val = val.lstrip(">#* \t")
+            if val and re.search(r"[0-9A-Za-z]", val):
+                candidates.append((m.end(), val))
 
         # 1) \boxed{...}（取最后一个；花括号配对，支持嵌套）
         last = raw.rfind("\\boxed")
@@ -490,7 +516,13 @@ class TaskLM:
         ):
             pass
         if m and m.group(1).strip():
-            candidates.append((m.start(), m.group(1).strip()))
+            val = m.group(1).strip()
+            # 剥 markdown 引用/加粗装饰（"> 4" 会让 re.match 类 judger
+            # 假阴性），再拒收纯标点捕获（'>' / '**'——last-marker-wins
+            # 会让它们压过规则 2/0 的真答案）
+            val = val.lstrip(">#* \t")
+            if val and re.search(r"[0-9A-Za-z]", val):
+                candidates.append((m.start(), val))
 
         # 4) <answer>X</answer> 标签（取最后一个）
         m = None
