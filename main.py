@@ -51,11 +51,13 @@ def _save_outputs(
     out_dir: Path, dataset: str, cfg, run_params: dict,
     history: list[dict], val_results: list[dict], engine: SROEngine,
     initial_baseline: list[dict] | None = None,
+    no_pattern_rerun: list[dict] | None = None,
 ) -> None:
     """Save run artifacts to out_dir (mirrors gepa_aime_v3 multi-file output).
 
     run_params: the actual values used this run (CLI overrides applied),
     so config.json/summary.json reflect what executed, not the .env defaults.
+    no_pattern_rerun: Phase 2b 对照组成绩（TEST_NO_PATTERN_RERUN 产出）。
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -117,6 +119,22 @@ def _save_outputs(
     else:
         summary["initial_prompt"] = None
         summary["val_improvement_vs_initial"] = None
+    # Phase 2b 对照组（TEST_NO_PATTERN_RERUN）：同 strategy 关 pattern 复测，
+    # 与正常 Phase 2 之差即 pattern 注入的净贡献
+    if no_pattern_rerun:
+        np_correct = sum(1 for r in no_pattern_rerun if r["correct"])
+        summary["no_pattern_rerun"] = {
+            "correct": np_correct,
+            "total": len(no_pattern_rerun),
+            "accuracy": (np_correct / len(no_pattern_rerun)
+                         if no_pattern_rerun else 0.0),
+        }
+        if val_results:
+            summary["pattern_injection_gain"] = (
+                val_correct / len(val_results) - np_correct / len(no_pattern_rerun))
+    else:
+        summary["no_pattern_rerun"] = None
+        summary["pattern_injection_gain"] = None
     (out_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -137,6 +155,12 @@ def _save_outputs(
     (out_dir / "val_results.json").write_text(
         json.dumps(val_results, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    # val_no_pattern.json — Phase 2b 对照组逐题成绩（no-pattern rerun 开启时）
+    if no_pattern_rerun is not None:
+        (out_dir / "val_no_pattern.json").write_text(
+            json.dumps(no_pattern_rerun, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+
     # history.json — per-iteration training records (incl. strategy snapshots)
     (out_dir / "history.json").write_text(
         json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -148,6 +172,8 @@ def _save_outputs(
     print("  - patterns.json      (all short-term patterns)")
     print("  - val_results.json   (per-question results + trajectories)")
     print("  - history.json       (per-iteration training records)")
+    if no_pattern_rerun is not None:
+        print("  - val_no_pattern.json (no-pattern rerun per-question results)")
 
 
 def run_dataset(
@@ -158,12 +184,14 @@ def run_dataset(
     test_match_method: str | None = None, reflect_wrong_only: bool | None = None,
     regularized_verify: bool | None = None, npo_window: int | None = None,
     cross_aware_gen: bool | None = None,
+    test_no_pattern_rerun: bool | None = None,
     skip_initial_baseline: bool = False,
 ) -> None:
     """Load a real dataset and run the two-phase loop, then save outputs.
 
     Phase 0 (optional): initial-prompt baseline on val; Phase 1: reflect-and-iterate
-    on train; Phase 2: inference + eval on val.
+    on train; Phase 2: inference + eval on val; Phase 2b (optional): same
+    strategy, patterns off, re-eval on val (test_no_pattern_rerun).
     """
     from sro.datasets import load
 
@@ -227,11 +255,25 @@ def run_dataset(
         })
     print(f"\nval accuracy: {correct}/{len(val)} = {correct / len(val):.2%}")
 
+    # Phase 2b：no-pattern 复测（同一 strategy、关 pattern 注入与动态学习）。
+    # 仅 test_use_patterns=True 时有意义（否则正常 Phase 2 已是纯策略硬答，
+    # 复测结果与其相同——此时忽略该参数并警告）。
+    no_pattern_rerun: list[dict] | None = None
+    rerun_on = (cfg.test_no_pattern_rerun
+                if test_no_pattern_rerun is None
+                else test_no_pattern_rerun)
+    if rerun_on and not test_use_patterns:
+        print("\n[Phase 2b] no-pattern rerun ignored: test_use_patterns is off "
+              "(normal Phase 2 already answers with strategy only)")
+    elif rerun_on:
+        no_pattern_rerun = engine.run_eval_no_patterns(val)
+
     # ---- save outputs ----
     run_params = {
         "n_train": n_train, "n_val": n_val, "n_iters": n_iters,
         "seed": seed, "dynamic_learning": dynamic_learning,
         "test_use_patterns": test_use_patterns,
+        "test_no_pattern_rerun": rerun_on,
         "evo_mode": evo_mode, "train_retrieve_ctx": train_retrieve_ctx,
         "aime_gepa_split": aime_gepa_split,
         "pattern_gen_mode": engine.pattern_gen_mode,
@@ -245,7 +287,7 @@ def run_dataset(
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = f"sro_output_{dataset}_{ts}"
     _save_outputs(Path(output_dir), dataset, cfg, run_params, history,
-                  val_results, engine, initial_baseline)
+                  val_results, engine, initial_baseline, no_pattern_rerun)
 
 
 def main() -> None:
@@ -323,6 +365,16 @@ def main() -> None:
     parser.add_argument("--no-cross-aware-gen", dest="cross_aware_gen",
                         action="store_false",
                         help="disable cross-aware generation (independent reflection prompts)")
+    parser.add_argument("--test-no-pattern-rerun", action="store_true",
+                        default=None,
+                        help="after the normal Phase 2 eval, re-run val once more with the SAME "
+                             "final strategy but patterns/dynamic-learning OFF (isolates how much "
+                             "pattern injection contributes); only meaningful with "
+                             "--test-use-patterns, ignored with a warning otherwise "
+                             "(default from .env: TEST_NO_PATTERN_RERUN)")
+    parser.add_argument("--no-test-no-pattern-rerun", dest="test_no_pattern_rerun",
+                        action="store_false",
+                        help="disable the no-pattern rerun pass")
     parser.add_argument("--skip-initial-baseline", action="store_true",
                         help="skip the Phase 0 initial-prompt baseline on val "
                              "(saves |val| extra LLM calls; summary fields become null)")
@@ -340,6 +392,7 @@ def main() -> None:
                     args.test_match_method, args.reflect_wrong_only,
                     args.regularized_verify, args.npo_window,
                     args.cross_aware_gen,
+                    args.test_no_pattern_rerun,
                     args.skip_initial_baseline)
     else:
         parser.print_help()
