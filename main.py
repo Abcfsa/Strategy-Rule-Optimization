@@ -288,7 +288,9 @@ def run_dataset(
         "regularized_verify": engine.regularized_verify,
         "npo_window": engine.npo_window,
         "cross_aware_gen": engine.cross_aware_gen,
-        "initial_prompt": engine.initial_prompt or "",
+        # None=未设置（走默认）；""(显式)=强制空起始策略。加 explicit 字段区分。
+        "initial_prompt": engine.initial_prompt if engine.initial_prompt is not None else "",
+        "initial_prompt_explicit": engine.initial_prompt is not None,
         "minibatch_size": engine.minibatch_size,
     }
     if output_dir is None:
@@ -379,11 +381,15 @@ def main() -> None:
                         help="disable cross-aware generation (independent reflection prompts)")
     parser.add_argument("--initial-prompt", type=str, default=None,
                         help="override the default starting strategy text for task_lm "
-                             "(e.g. GEPA's original INITIAL_WRITER_PROMPT); empty = per-mode "
-                             "default (classic: empty strategy, gepa/npo: generic fallback). "
-                             "Works with --cross-aware-gen: pattern-extraction prompts see this "
-                             "text as the current strategy from iteration 1 "
-                             "(default from .env: INITIAL_PROMPT)")
+                             "(e.g. GEPA's original INITIAL_WRITER_PROMPT). NOT passing it "
+                             "(and empty .env INITIAL_PROMPT) = per-mode default (classic: "
+                             "empty strategy, gepa/npo: generic fallback). Passing an "
+                             "explicitly EMPTY or whitespace string (e.g. --initial-prompt "
+                             "' ') = force an empty starting strategy: no gepa/npo fallback "
+                             "prompt, task_lm gets only the dataset format instruction. "
+                             "Works with --cross-aware-gen: pattern-extraction prompts see "
+                             "this text as the current strategy from iteration 1 "
+                             "(default from .env: INITIAL_PROMPT; env blank = not set)")
     parser.add_argument("--test-no-pattern-rerun", action="store_true",
                         default=None,
                         help="after the normal Phase 2 eval, re-run val once more with the SAME "

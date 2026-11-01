@@ -83,15 +83,17 @@ class SROEngine:
         self.pattern_gen_mode = self.reflection_lm.pattern_gen_mode
         self.reflect_wrong_only = self.reflection_lm.reflect_wrong_only
         self.cross_aware_gen = self.reflection_lm.cross_aware_gen
-        # 初始 strategy 文本（显式传入优先，否则读 .env）。非空时替代各模式
-        # 默认起始 prompt：classic 从空 strategy 变为该文本（训练前也有方法论
-        # 可用）；gepa/npo 的候选池/链起点从 _default_prompt() 变为该文本。
-        # 注入后 Phase 0 基线、classic 反思、cross_aware_gen 的 pattern 提示
-        # （strategy_text 注入点读 task_lm.strategy.text）自动感知新起点。
-        self.initial_prompt = (cfg.initial_prompt
+        # 初始 strategy 文本（显式传入优先，否则读 .env）。None=未设置（走各
+        # 模式默认）；非 None（含空串）=显式设置：非空时替代默认起始 prompt，
+        # 显式空串 = 强制空起始策略（classic 空 strategy / gepa、npo 起点
+        # 不再兜底 _default_prompt()）。CLI 传空白字符串按"显式空"处理，
+        # 不折叠回默认。注入后 Phase 0 基线、classic 反思、cross_aware_gen
+        # 的 pattern 提示（strategy_text 注入点读 task_lm.strategy.text）
+        # 自动感知新起点。
+        self.initial_prompt = (cfg.initial_prompt or None
                                if initial_prompt is None
                                else str(initial_prompt).strip())
-        if self.initial_prompt:
+        if self.initial_prompt is not None:
             self.task_lm.strategy = Strategy(text=self.initial_prompt, version=0)
         # STEVE 正则化验证门控（仅 gepa 模式生效；npo 模式下警告并忽略——
         # NPO 的哲学是无接受门控、无条件进链，加门控就不是 NPO 了）
@@ -342,7 +344,12 @@ class SROEngine:
         history: list[dict] = []
 
         # Step 1: initialize candidate pool
-        init_text = self.task_lm.strategy.text or _default_prompt()
+        # 显式设置过 initial_prompt（含空串）则原样使用（空=无策略纯格式指令）；
+        # 否则回退现有 strategy 或通用兜底。
+        if self.initial_prompt is not None:
+            init_text = self.initial_prompt
+        else:
+            init_text = self.task_lm.strategy.text or _default_prompt()
         candidates: list[Strategy] = [Strategy(text=init_text, version=0)]
         candidates[0].val_scores = self._eval_candidate(candidates[0], val_for_pareto)
         candidates[0].score = sum(candidates[0].val_scores) / n_val
@@ -563,7 +570,11 @@ class SROEngine:
         # Window of (Strategy, traces, val_score), oldest first, maxlen=W
         window: deque = deque(maxlen=self.npo_window)
 
-        init_text = self.task_lm.strategy.text or _default_prompt()
+        # 同 gepa：显式设置过 initial_prompt（含空串）原样使用，不兜底。
+        if self.initial_prompt is not None:
+            init_text = self.initial_prompt
+        else:
+            init_text = self.task_lm.strategy.text or _default_prompt()
         current = Strategy(text=init_text, version=0)
         current.val_scores = self._eval_candidate(current, val_subset)
         current.score = sum(current.val_scores) / n_val
