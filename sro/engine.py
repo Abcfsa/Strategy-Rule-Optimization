@@ -52,7 +52,7 @@ class SROEngine:
         embedder: Optional[Embedder] = None,
         kb: Optional[KnowledgeBase] = None,
         match_threshold: float = 0.6,   # 命中阈值
-        top_k: int = 3,                  # 检索条数
+        top_k: int = 3,                  # 检索组数（配对选择：一组=同 run_id 的全部条目）
         dynamic_learning: bool = True,   # miss 时是否走动态学习
         test_use_patterns: bool = True,  # 测试时是否注入短期规律作 context
         evo_mode: str = "classic",
@@ -181,8 +181,9 @@ class SROEngine:
             for sample in train_set:
                 ctx_examples = []
                 if self.train_retrieve_ctx:
-                    ctx_examples = self.kb.retrieve(
-                        sample.problem, k=self.top_k, threshold=self.match_threshold
+                    ctx_examples = self.kb.retrieve_paired(
+                        sample.problem, k=self.top_k,
+                        threshold=self.match_threshold
                     )
                 trace = self.task_lm.run(
                     sample.problem,
@@ -287,8 +288,9 @@ class SROEngine:
         for sample in minibatch:
             ctx_examples = []
             if self.train_retrieve_ctx:
-                ctx_examples = self.kb.retrieve(
-                    sample.problem, k=self.top_k, threshold=self.match_threshold
+                ctx_examples = self.kb.retrieve_paired(
+                    sample.problem, k=self.top_k,
+                    threshold=self.match_threshold
                 )
             trace = self.task_lm.run(
                 sample.problem,
@@ -704,25 +706,67 @@ class SROEngine:
         return results
 
     def _llm_match(self, question: str) -> list:
-        """LLM 匹配：向量粗召回 top-recall_k → LLM 判断适用性 → 取前 top_k 条。
+        """LLM 匹配（组级）：向量粗召回 top-recall_k 组 → LLM 判组内条目
+        适用性 → 取前 top_k 组，每组注入全部条目。
 
+        粗召回/精选/兜底结构与条级版本相同，唯一区别是选择单位为组
+        （source_run_id；rich 模式下即"错误定位+解决办法"对）。
+        LLM 选中某组的任一条 → 该组整组入选（保持 LLM 选中顺序），
+        空 id 条目自身单独成组。
         失败兜底：LLM 调用失败 / 输出解析失败 / 占位模式（无 key）→
-        回落纯 vector 匹配（match_threshold），保证测试不崩。
+        回落纯 vector 配对匹配（match_threshold），保证测试不崩。
         LLM 判全部不适用 → 返回 []，正常走 miss 分支。
         """
-        # 粗召回：最宽松阈值（-1.0），纯按相似度排序取 top recall_k；
-        # 适用性交给 LLM 判断，召回阶段不做质量过滤
-        candidates = self.kb.retrieve(question, k=self.llm_match_recall_k,
-                                      threshold=-1.0)
-        if not candidates:
+        # 粗召回组：最宽松阈值（-1.0），纯按组相似度排序取 top recall_k 组
+        group_keys = self.kb.retrieve_group_keys(
+            question, k=self.llm_match_recall_k, threshold=-1.0)
+        if not group_keys:
             return []
+        # 展开成条目列表喂给 judge（保持组序、组内条目相邻）
+        candidates: list = []
+        for gk in group_keys:
+            candidates.extend(self.kb.expand_group(gk))
         indices = self.reflection_lm.judge_pattern_matches(question, candidates)
         if indices is None:
-            # LLM 不可用/解析失败 → 回落 vector 匹配
-            return self.kb.retrieve(question, k=self.top_k,
-                                    threshold=self.match_threshold)
-        # 按 LLM 选中下标取规律，保持粗召回的相似度序，最多 top_k 条
-        return [candidates[i] for i in indices[: self.top_k]]
+            # LLM 不可用/解析失败 → 回落 vector 配对匹配
+            return self.kb.retrieve_paired(
+                question, k=self.top_k, threshold=self.match_threshold)
+        # 选中条目按组去重（空 id 单例按对象身份），最多 top_k 组
+        result: list = []
+        picked_groups: set = set()
+        for i in indices:
+            e = candidates[i]
+            gid = e.source_run_id or f"__solo__{id(e)}"
+            if gid in picked_groups:
+                continue
+            if len(picked_groups) >= self.top_k:
+                break
+            picked_groups.add(gid)
+            if e.source_run_id:
+                result.extend(self.kb.expand_group(e.source_run_id))
+            else:
+                result.append(e)
+        return result
+
+    def _random_match(self, question: str) -> list:
+        """random 匹配（消融用，组级）：向量粗召回 top-random_match_recall_n
+        组 → 无任何适用性判据，从中随机抽 top_k 组，整组注入。
+
+        与 llm 模式相同的组级粗召回（threshold=-1.0），区别只在第二阶段：
+        llm 用 judge 精选，random 用无放回随机抽组。
+        用于回答"命中收益来自 LLM 判适用性，还是仅仅来自注入了 pattern"。
+        抽样用 self._random_match_rng（seed 派生），同 seed 同题库顺序可复现。
+        """
+        group_keys = self.kb.retrieve_group_keys(
+            question, k=self.random_match_recall_n, threshold=-1.0)
+        if not group_keys:
+            return []
+        k = min(self.top_k, len(group_keys))
+        picked = self._random_match_rng.sample(group_keys, k)
+        out: list = []
+        for gk in picked:
+            out.extend(self.kb.expand_group(gk))
+        return out
 
     def run_eval_no_patterns(self, val: list[TrainSample]) -> list[dict]:
         """Phase 2 复测：同一 strategy，关闭 pattern 注入与动态学习硬答 val。
@@ -757,37 +801,22 @@ class SROEngine:
               f"{correct}/{len(val)} = {acc:.2%}")
         return results
 
-    def _random_match(self, question: str) -> list:
-        """random 匹配（消融用）：向量粗召回 top-random_match_recall_n →
-        无任何适用性判据，从中随机抽 top_k 条。
-
-        与 llm 模式相同的粗召回（threshold=-1.0，不做质量过滤），区别只在
-        第二阶段：llm 用 judge 精选，random 用无放回随机抽样。
-        用于回答"命中收益来自 LLM 判适用性，还是仅仅来自注入了 pattern"。
-        抽样用 self._random_match_rng（seed 派生），同 seed 同题库顺序可复现。
-        """
-        candidates = self.kb.retrieve(question, k=self.random_match_recall_n,
-                                      threshold=-1.0)
-        if not candidates:
-            return []
-        k = min(self.top_k, len(candidates))
-        return self._random_match_rng.sample(candidates, k)
-
     def inference(self, question: str, verbose: bool = False) -> tuple[str, dict]:
         """测试推理，含命中/不匹配两条分支。
 
         返回 (answer, meta)，meta 记录走了哪条分支、命中了哪些规律。
         miss 时：若 dynamic_learning 开启则走动态学习，否则直接硬答。
         """
-        # ---- 匹配机制：按 test_match_method 分发 ----
+        # ---- 匹配机制：按 test_match_method 分发（均组级：选 k 组、注入整组）----
         if self.test_use_patterns:
             if self.test_match_method == "llm":
                 hits = self._llm_match(question)
             elif self.test_match_method == "random":
                 hits = self._random_match(question)
             else:
-                hits = self.kb.retrieve(question, k=self.top_k,
-                                        threshold=self.match_threshold)
+                hits = self.kb.retrieve_paired(
+                    question, k=self.top_k,
+                    threshold=self.match_threshold)
         else:
             hits = []
         hit = bool(hits)
@@ -836,8 +865,8 @@ class SROEngine:
         if verbose:
             print("[MISS] dynamic learning triggered: induce temporary pattern -> second-round attempt")
         if self.test_use_patterns:
-            hits = self.kb.retrieve(question, k=self.top_k,
-                                   threshold=0.0)  # 临时放宽，确保取到刚加的
+            hits = self.kb.retrieve_paired(question, k=self.top_k,
+                                           threshold=0.0)  # 临时放宽，确保取到刚加的
         else:
             hits = []  # test_use_patterns 关闭：规律照归纳入 KB，但不注入 context
         trace = self.task_lm.run(question, context_examples=hits)

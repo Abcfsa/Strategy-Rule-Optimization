@@ -69,6 +69,99 @@ class KnowledgeBase:
         scored.sort(key=lambda se: se[0], reverse=True)
         return [e for _, e in scored[:k]]
 
+    def retrieve_paired(self, query: str, k: int = 3,
+                        threshold: float = 0.6) -> list[Example]:
+        """按 source_run_id 分组的"配对检索"：选 k 组，组内全部条目一起返回。
+
+        rich 模式下同一 trace 产两条互补规律（wrong: 错误步骤定位 + 避坑教训；
+        correct: 有效做法 + 触发规则），id 相同。本方法保证选择以组为单位：
+        k=3 即 3 个不同 run_id（最多 3"对"），组内所有条目（通常 2 条）都注入，
+        杜绝"只选中错误定位、丢了对应解决办法"的半对状态。
+
+        组得分 = 组内条目与 query 相似度的最大值；组内至少一条 >= threshold
+        该组才入候选。run_id 为空串的规律（聚类规律、动态学习临时项若未带 id）
+        各自单独成组。返回按组得分降序排列的扁平列表（组内保持池内顺序）。
+        """
+        if not self.examples:
+            return []
+        q_vec = self.embedder.embed(query)
+        # 分组：保持首次出现的顺序，组内保持池内顺序
+        groups: dict[str, list[float]] = {}
+        order: list[str] = []
+        for e in self.examples:
+            if e.embedding is None:
+                continue
+            s = self._cosine(q_vec, e.embedding)
+            key = e.source_run_id or ""   # 空 id 每条自成一组
+            if e.source_run_id:
+                if key not in groups:
+                    groups[key] = []
+                    order.append(key)
+                groups[key].append(s)
+            else:
+                # 空 id：无配对语义，单独成组（用临时唯一键）
+                tkey = f"__solo__{id(e)}"
+                groups[tkey] = [s]
+                order.append(tkey)
+        # 组得分 = 组内最大相似度；阈值过滤在组级（任一条过线即组过线）
+        scored_groups = [(max(groups[g]), g) for g in order]
+        scored_groups = [(s, g) for s, g in scored_groups if s >= threshold]
+        scored_groups.sort(key=lambda sg: sg[0], reverse=True)
+        picked: list[Example] = []
+        for _, g in scored_groups[:k]:
+            if g.startswith("__solo__"):
+                # 单例组：直接找回那条
+                for e in self.examples:
+                    if e.embedding is not None and not e.source_run_id \
+                            and f"__solo__{id(e)}" == g:
+                        picked.append(e)
+                        break
+            else:
+                picked.extend(e for e in self.examples
+                              if e.source_run_id == g and e.embedding is not None)
+        return picked
+
+    def retrieve_group_keys(self, query: str, k: int,
+                            threshold: float = 0.6) -> list[str]:
+        """配对检索的组选择子步：返回 top-k 组的键（run_id；空 id 返回占位键）。
+
+        供 llm/random 匹配做组级抽样/精选：先选组，再用 expand_group 取整组。
+        键格式与 retrieve_paired 内部一致（__solo__<id> 为单例组占位键）。
+        """
+        if not self.examples:
+            return []
+        q_vec = self.embedder.embed(query)
+        groups: dict[str, list[float]] = {}
+        order: list[str] = []
+        for e in self.examples:
+            if e.embedding is None:
+                continue
+            s = self._cosine(q_vec, e.embedding)
+            if e.source_run_id:
+                if e.source_run_id not in groups:
+                    groups[e.source_run_id] = []
+                    order.append(e.source_run_id)
+                groups[e.source_run_id].append(s)
+            else:
+                tkey = f"__solo__{id(e)}"
+                groups[tkey] = [s]
+                order.append(tkey)
+        scored_groups = [(max(groups[g]), g) for g in order]
+        scored_groups = [(s, g) for s, g in scored_groups if s >= threshold]
+        scored_groups.sort(key=lambda sg: sg[0], reverse=True)
+        return [g for _, g in scored_groups[:k]]
+
+    def expand_group(self, key: str) -> list[Example]:
+        """取出一个组（run_id）的全部规律；__solo__<id> 键取对应单条。"""
+        if key.startswith("__solo__"):
+            for e in self.examples:
+                if e.embedding is not None and not e.source_run_id \
+                        and f"__solo__{id(e)}" == key:
+                    return [e]
+            return []
+        return [e for e in self.examples
+                if e.source_run_id == key and e.embedding is not None]
+
     def best_similarity(self, query: str) -> float:
         """查询与规律池的最高相似度，供"是否命中"判定。"""
         if not self.examples:
