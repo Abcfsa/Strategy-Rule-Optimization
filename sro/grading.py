@@ -6,7 +6,7 @@
 - math    : extract_boxed + LaTeX 归一化 + AST 数值求值
 - gsm8k   : 数字清理（整数/小数/分数）
 - aime    : 0-999 整数清理
-- hotpotqa: SQuAD 风格文本归一化 + 词边界匹配
+- hotpotqa: SQuAD 风格文本归一化 + 严格 EM（官方口径，无子串匹配）
 """
 
 from __future__ import annotations
@@ -246,20 +246,18 @@ def _normalize_text(s: str) -> str:
 
 
 def evaluate_hotpotqa(prediction: str, ground_truth: str) -> bool:
-    """HotpotQA 答案比较（规范化精确匹配 + 词边界包含匹配）。"""
+    """HotpotQA 答案比较（严格：规范化后全串相等）。
+
+    与官方 hotpot_evaluate_v1.py 的 exact_match_score 同口径：
+    normalize_answer（小写、去标点、去 a/an/the、压空格）后整串比对，
+    不做任何子串/包含匹配。模型输出带解释性后缀（"Greta Garbo (film)"）
+    按错判——与论文报告的 EM 可直接对比。
+    """
     pred_clean = _normalize_text(prediction)
     gt_clean = _normalize_text(ground_truth)
     if not gt_clean:
         return not pred_clean
-    if pred_clean == gt_clean:
-        return True
-    if not pred_clean:
-        return False
-    if re.search(r'\b' + re.escape(gt_clean) + r'\b', pred_clean):
-        return True
-    if re.search(r'\b' + re.escape(pred_clean) + r'\b', gt_clean):
-        return True
-    return False
+    return pred_clean == gt_clean
 
 
 # ---------------------------------------------------------------------------
