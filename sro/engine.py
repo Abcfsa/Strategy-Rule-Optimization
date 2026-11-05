@@ -148,12 +148,18 @@ class SROEngine:
         n_iters: int = 3,
         candidates_per_iter: int = 2,
         verbose: bool = True,
+        val_set: list[TrainSample] | None = None,
     ) -> list[dict]:
-        """训练闭环。按 evo_mode 分流。返回每轮历史记录。"""
+        """训练闭环。按 evo_mode 分流。返回每轮历史记录。
+
+        val_set: GEPA/NPO 模式的接受判据与 Pareto 评估集（GEPA 协议：
+        训练在 train_set 上 rollout，候选是否更优由 val_set 表现决定）。
+        None 时退化为旧行为——从 train_set 内切 1/4 当内部 val。
+        """
         if self.evo_mode == "gepa":
-            return self._train_gepa(train_set, verbose)
+            return self._train_gepa(train_set, verbose, val_set=val_set)
         if self.evo_mode == "npo":
-            return self._train_npo(train_set, n_iters, verbose)
+            return self._train_npo(train_set, n_iters, verbose, val_set=val_set)
         return self._train_classic(train_set, n_iters, candidates_per_iter, verbose)
 
     def _train_classic(
@@ -316,11 +322,16 @@ class SROEngine:
     # -------------------------------------------------------------------
 
     def _train_gepa(self, train_set: list[TrainSample],
-                    verbose: bool) -> list[dict]:
+                    verbose: bool,
+                    val_set: list[TrainSample] | None = None) -> list[dict]:
         """GEPA-style training: Pareto front + minibatch + budget + keep-better.
 
         Mirrors gepa_aime_v3.py main loop. KB coexists: short patterns from
         reflection are added to KB alongside the Pareto candidate pool.
+
+        val_set: GEPA 协议的验证集——minibatch（train_pool 采样）上的严格改进
+        预筛通过后，候选在全量 val_set 上评估并更新 per-instance Pareto 前沿，
+        "更优"判定即基于 val_set 分数。None 时退化为旧行为（train 内切 1/4）。
         """
         import random
         from .pareto import build_pareto_fronts, select_candidate_from_pareto_front
@@ -329,13 +340,22 @@ class SROEngine:
             print("[Info] GEPA mode is budget-controlled (max_metric_calls); n_iters is ignored.")
 
         rng = random.Random(self.seed)
-        # Pareto validation subset: cut 1/4 of train for internal Pareto validation.
-        # The real val split is reserved for final evaluation in main.py.
-        n_val = max(1, len(train_set) // 4)
-        val_for_pareto = train_set[:n_val]
-        train_pool = train_set[n_val:]
-        if not train_pool:
-            train_pool = list(train_set)  # degenerate: all used as both
+        if val_set:
+            # GEPA 协议：train 全量做 minibatch 池，val 做接受判据/Pareto 评估
+            val_for_pareto = list(val_set)
+            train_pool = list(train_set)
+            if verbose:
+                print(f"[Split] GEPA protocol: train_pool={len(train_pool)}"
+                      f" (minibatch source), val={len(val_for_pareto)}"
+                      f" (acceptance/Pareto)")
+        else:
+            # 旧行为：train 内切 1/4 当内部 Pareto 验证（val 留给 main.py 终评）
+            n_val_internal = max(1, len(train_set) // 4)
+            val_for_pareto = train_set[:n_val_internal]
+            train_pool = train_set[n_val_internal:]
+            if not train_pool:
+                train_pool = list(train_set)  # degenerate: all used as both
+        n_val = len(val_for_pareto)
         budget_used = 0
         history: list[dict] = []
 
@@ -522,7 +542,8 @@ class SROEngine:
     # -------------------------------------------------------------------
 
     def _train_npo(self, train_set: list[TrainSample], n_iters: int,
-                   verbose: bool) -> list[dict]:
+                   verbose: bool,
+                   val_set: list[TrainSample] | None = None) -> list[dict]:
         """NPO-style training (arXiv:2608.27266 Algorithm 1): single lineage,
         sliding-window teacher feedback, NO acceptance gate.
 
@@ -546,13 +567,19 @@ class SROEngine:
         from collections import deque
 
         rng = random.Random(self.seed)
-        # Same split convention as gepa mode: first 1/4 of train = internal
-        # validation, rest = train pool. Real val split stays for main.py.
-        n_val = max(1, len(train_set) // 4)
-        val_subset = train_set[:n_val]
-        train_pool = train_set[n_val:]
-        if not train_pool:
+        if val_set:
+            # Same convention as gepa mode: dedicated val = per-iter eval set,
+            # full train = minibatch pool.
+            val_subset = list(val_set)
             train_pool = list(train_set)
+        else:
+            # Legacy: first 1/4 of train = internal validation, rest = pool.
+            n_val_internal = max(1, len(train_set) // 4)
+            val_subset = train_set[:n_val_internal]
+            train_pool = train_set[n_val_internal:]
+            if not train_pool:
+                train_pool = list(train_set)
+        n_val = len(val_subset)
 
         if verbose and self.regularized_verify:
             print("[Warn] REGULARIZED_VERIFY is GEPA-only (NPO has no"

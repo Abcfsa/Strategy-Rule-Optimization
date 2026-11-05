@@ -70,7 +70,10 @@ def _save_outputs(
     (out_dir / "config.json").write_text(
         json.dumps(config_snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # summary.json — high-level training + val results (uses actual run params)
+    # summary.json — high-level training + final-eval results (uses actual run params)
+    # 注意：val_results 现为最终评估集（test，GEPA 协议）的逐题结果；
+    # val_correct/val_total/val_accuracy 字段名保留以兼容旧分析脚本，
+    # 实际语义由 eval_on 字段标明（"test" 或回退 "val"）。
     val_correct = sum(1 for r in val_results if r["correct"])
     # val_results/baseline 不落盘明细（轨迹大）；基线只进 summary 汇总
     summary = {
@@ -78,6 +81,8 @@ def _save_outputs(
         "evo_mode": run_params["evo_mode"],
         "n_train": run_params["n_train"],
         "n_val": run_params["n_val"],
+        "n_test": run_params["n_test"],
+        "eval_on": run_params["eval_on"],
         "n_iters": run_params["n_iters"],
         "seed": run_params["seed"],
         "dynamic_learning": run_params["dynamic_learning"],
@@ -104,7 +109,8 @@ def _save_outputs(
         "val_total": len(val_results),
         "val_accuracy": (val_correct / len(val_results) if val_results else 0.0),
     }
-    # 初始 prompt 基线（Phase 0）：训练前的 val 成绩 + 最终 vs 初始的提升
+    # 初始 prompt 基线（Phase 0）：训练前在同一评估集（test）上的成绩，
+    # 与 Phase 2 最终成绩直接可比；提升量 = 最终 − 初始。
     if initial_baseline:
         base_correct = sum(1 for r in initial_baseline if r["correct"])
         summary["initial_prompt"] = {
@@ -153,7 +159,7 @@ def _save_outputs(
 
 
 def run_dataset(
-    dataset: str, n_train: int, n_val: int, n_iters: int,
+    dataset: str, n_train: int, n_val: int, n_test: int, n_iters: int,
     seed: int, dynamic_learning: bool, output_dir: str | None,
     evo_mode: str, train_retrieve_ctx: bool, test_use_patterns: bool,
     gepa_split: bool = False, pattern_gen_mode: str | None = None,
@@ -164,8 +170,10 @@ def run_dataset(
 ) -> None:
     """Load a real dataset and run the two-phase loop, then save outputs.
 
-    Phase 0 (optional): initial-prompt baseline on val; Phase 1: reflect-and-iterate
-    on train; Phase 2: inference + eval on val.
+    GEPA 协议三集分工：Phase 0 (optional) 初始 prompt 基线跑 test；
+    Phase 1 在 train 上反思迭代，候选接受与否由 val 表现决定（gepa/npo 模式）；
+    Phase 2 最终推理评估跑 test（优化结束后只评一次）。test 为空时 Phase 0/2
+    回退用 val 并告警。
     """
     from sro.datasets import load
 
@@ -174,9 +182,15 @@ def run_dataset(
         print("[WARN] OPENAI_API_KEY not set; using placeholder LM (data-flow demo only).")
 
     print(f"########## Loading dataset: {dataset} ##########")
-    train, val = load(dataset, n_train=n_train, n_val=n_val, seed=seed,
-                      gepa_split=gepa_split)
-    print(f"  train: {len(train)} samples | val: {len(val)} samples")
+    train, val, test = load(dataset, n_train=n_train, n_val=n_val,
+                            n_test=n_test, seed=seed, gepa_split=gepa_split)
+    print(f"  train: {len(train)} samples | val: {len(val)} samples"
+          f" | test: {len(test)} samples")
+    if not test:
+        print("  [WARN] test set empty; Phase 0/2 fall back to val"
+              " (NOT GEPA-protocol comparable).")
+    eval_set = test if test else val
+    eval_name = "test" if test else "val (fallback: empty test)"
 
     engine = SROEngine(
         match_threshold=cfg.match_threshold, top_k=cfg.top_k,
@@ -200,15 +214,16 @@ def run_dataset(
     if skip_initial_baseline:
         print("\n[Phase 0] initial-prompt baseline: skipped (--skip-initial-baseline)")
     else:
-        initial_baseline = engine.run_initial_baseline(val)
+        initial_baseline = engine.run_initial_baseline(eval_set)
 
     print(f"\n########## Phase 1: Training & Reflection Loop ({n_iters} iters) ##########")
-    history = engine.train_and_reflect(train, n_iters=n_iters, verbose=True)
+    history = engine.train_and_reflect(train, n_iters=n_iters, verbose=True,
+                                       val_set=val)
 
-    print(f"\n########## Phase 2: Inference eval on val ({len(val)} samples) ##########")
+    print(f"\n########## Phase 2: Inference eval on {eval_name} ({len(eval_set)} samples) ##########")
     val_results: list[dict] = []
     correct = 0
-    for i, sample in enumerate(val, 1):
+    for i, sample in enumerate(eval_set, 1):
         answer, meta = engine.inference(sample.problem, verbose=False)
         # grade with the injected judger (consistent with training)
         ok = engine.task_lm.judger(answer, sample.answer) if engine.task_lm.judger else False
@@ -227,11 +242,12 @@ def run_dataset(
             "matched_examples": meta.get("matched_examples", []),
             "raw": meta.get("raw", ""),
         })
-    print(f"\nval accuracy: {correct}/{len(val)} = {correct / len(val):.2%}")
+    print(f"\n{eval_name} accuracy: {correct}/{len(eval_set)} = {correct / len(eval_set):.2%}")
 
     # ---- save outputs ----
     run_params = {
-        "n_train": n_train, "n_val": n_val, "n_iters": n_iters,
+        "n_train": n_train, "n_val": n_val, "n_test": n_test,
+        "eval_on": eval_name, "n_iters": n_iters,
         "seed": seed, "dynamic_learning": dynamic_learning,
         "test_use_patterns": test_use_patterns,
         "evo_mode": evo_mode, "train_retrieve_ctx": train_retrieve_ctx,
@@ -265,6 +281,9 @@ def main() -> None:
                         help=f"number of train samples (default from .env: {cfg.n_train})")
     parser.add_argument("--n-val", type=int, default=cfg.n_val,
                         help=f"number of val samples (default from .env: {cfg.n_val})")
+    parser.add_argument("--n-test", type=int, default=cfg.n_test,
+                        help=f"number of test samples for final evaluation "
+                             f"(default from .env: {cfg.n_test}; ignored when --gepa-split)")
     parser.add_argument("--n-iters", type=int, default=cfg.n_iters,
                         help=f"number of training iterations (default from .env: {cfg.n_iters})")
     parser.add_argument("--seed", type=int, default=cfg.seed,
@@ -339,7 +358,8 @@ def main() -> None:
     if args.demo:
         demo()
     elif args.dataset:
-        run_dataset(args.dataset, args.n_train, args.n_val, args.n_iters,
+        run_dataset(args.dataset, args.n_train, args.n_val, args.n_test,
+                    args.n_iters,
                     args.seed, args.dynamic_learning, args.output_dir,
                     args.evo_mode, args.train_retrieve_ctx, args.test_use_patterns,
                     args.gepa_split, args.pattern_gen_mode,

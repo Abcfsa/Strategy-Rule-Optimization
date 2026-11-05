@@ -37,6 +37,7 @@ DEFAULTS = {
     # ---- 实验参数（数据规模 / 训练轮次 / 开关）----
     "N_TRAIN": "50",
     "N_VAL": "30",
+    "N_TEST": "150",
     "N_ITERS": "3",
     "SEED": "42",
     "DYNAMIC_LEARNING": "true",
@@ -111,6 +112,7 @@ class Config:
     # 实验参数
     n_train: int
     n_val: int
+    n_test: int
     n_iters: int
     seed: int
     dynamic_learning: bool
@@ -180,6 +182,7 @@ class Config:
             extra_params=g("EXTRA_PARAMS"),
             n_train=int(g("N_TRAIN")),
             n_val=int(g("N_VAL")),
+            n_test=int(g("N_TEST")),
             n_iters=int(g("N_ITERS")),
             seed=int(g("SEED")),
             dynamic_learning=_parse_bool(g("DYNAMIC_LEARNING")),
