@@ -123,7 +123,8 @@ class SROEngine:
         pupa。判分逻辑复用
         openai_api_test 中已验证的函数，保证与基线一致。
 
-        gepa_split: 仅 aime 生效，True 时用 ### 答案格式（对齐 GEPA）。
+        gepa_split: True 时对格式注入仅 aime 有差别（用 ### 答案格式，对齐
+        GEPA init_dataset）；划分侧的 gepa_split 逻辑在 datasets.load 内。
         """
         from .datasets import _import_eval
         from .llm import DATASET_FORMAT_INSTRUCTIONS, DATASET_ANSWER_TYPES

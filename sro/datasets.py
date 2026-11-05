@@ -5,6 +5,8 @@
       （val 在前，train 数量变动不影响 val 集稳定性）
     - HotpotQA 用原生 train/dev 文件，dev 当 val
     - AIME 用 aimo-validation-aime 作为 train+val 池
+    - gepa_split=True 时对所有数据集生效：忽略 n_train/n_val/seed，
+      改用 GEPA_SPLIT_SIZES 固定规模 + seed=0（详见 load() docstring）
     - MATH-500 是纯 test 集（500 题），同走 _shuffle_split 切出 train+val
     - IFBench / LiveBench 是纯 test 集（无 train 标注），按同一 _shuffle_split
       从 test 池切出 train+val 供 SRO 两阶段闭环使用
@@ -316,11 +318,14 @@ def _load_livebench(n_train: int, n_val: int, seed: int):
     return _shuffle_split(items, n_train, n_val, seed)
 
 
-def _load_pupa(n_train: int, n_val: int, seed: int):
+def _load_pupa(n_train: int, n_val: int, seed: int, positional: bool = False):
     """PUPA 隐私脱敏：user_query 含 PII，要求输出脱敏后 query。
 
     answer_type=redaction，answer=gold JSON{pii_units, redacted_query}；
     problem 用含 PII 的 user_query。默认读 PUPA_New.csv（PUPA_PATH 可覆盖）。
+
+    positional=True（GEPA 协议）：不 shuffle，按 csv 原始行序取前
+    n_train 做 train、随后 n_val 做 val（GEPA 保留原始位置划分 111/111/221）。
     """
     d = _data_dir("pupa")
     cfg = get_config()
@@ -353,6 +358,11 @@ def _load_pupa(n_train: int, n_val: int, seed: int):
                                   ensure_ascii=False),
                 answer_type="redaction",
             ))
+    if positional:
+        if n_train + n_val > len(items):
+            raise ValueError(
+                f"Not enough data: total={len(items)}, need {n_train}+{n_val}")
+        return items[:n_train], items[n_train:n_train + n_val]
     return _shuffle_split(items, n_train, n_val, seed)
 
 
@@ -372,18 +382,54 @@ _LOADERS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# GEPA 协议划分（gepa_split=True 时对所有数据集生效）
+# ---------------------------------------------------------------------------
+
+# GEPA-original (arXiv:2507.19457) 的划分规模：
+#   HotpotQA 150/300(/300 test) · AIME 45/45(/30 test) · IFBench 150/300(/294 test)
+#   LiveBench-Math ~123/~123(/~122 test, seed=0 三等分) · PUPA 111/111(/221 test, 原始位置划分)
+# test 集留待下一步三元组重构接入，本表只含 train/val。
+# GSM8K / MATH / MATH-500 为 GEPA 未使用的数据集，无论文规格，
+# 对齐 GEPA 量级取 150/300（LiveBench 取 seed=0 三等分前两份，~133/~133）。
+GEPA_SPLIT_SIZES = {
+    "gsm8k":     (150, 300),
+    "math":      (150, 300),
+    "math500":   (150, 300),
+    "hotpotqa":  (150, 300),
+    "ifbench":   (150, 300),
+    "livebench": (133, 133),
+    "pupa":      (111, 111),
+    # aime 走专属协议（对半切），不走此表
+}
+
+GEPA_SPLIT_SEED = 0  # GEPA 固定划分 seed
+
+
 def load(dataset: str, n_train: int = 50, n_val: int = 30, seed: int = 42,
          gepa_split: bool = False):
     """加载指定数据集，返回 (train, val): tuple[list[TrainSample], list[TrainSample]]。
 
     dataset: gsm8k / math / math500 / aime / hotpotqa / ifbench / livebench / pupa
 
-    gepa_split: 仅 aime 生效，完全复刻 GEPA init_dataset() 划分（seed=0 + 对半切 + ### 前缀）。
+    gepa_split: True 时对**所有数据集**生效，复刻 GEPA 协议划分——忽略
+    n_train / n_val / seed，改用 GEPA_SPLIT_SIZES 的固定规模与 GEPA_SPLIT_SEED：
+      - aime:      Random(0) 打乱 + 对半切 + "### " 答案前缀（init_dataset 原协议）
+      - pupa:      原始位置划分，不 shuffle，前 111/111
+      - livebench: Random(0) 打乱后三等分，取前两份（~133/~133）
+      - 其余:      Random(0) 打乱后取 150/300（val 在前，与 _shuffle_split 同构）
+    本地池不足 GEPA 规模时按 _shuffle_split 的 clamp 自动收缩
+    （如 math500 共 500 题，150/300 收缩为 150/250）。
     """
     if dataset not in _LOADERS:
         raise ValueError(f"unknown dataset '{dataset}'; choose from {list(_LOADERS)}")
-    if dataset == "aime":
-        return _LOADERS[dataset](n_train, n_val, seed, gepa_split=gepa_split)
+    if gepa_split:
+        if dataset == "aime":
+            return _LOADERS[dataset](0, 0, GEPA_SPLIT_SEED, gepa_split=True)
+        nt, nv = GEPA_SPLIT_SIZES[dataset]
+        if dataset == "pupa":
+            return _LOADERS[dataset](nt, nv, GEPA_SPLIT_SEED, positional=True)
+        return _LOADERS[dataset](nt, nv, GEPA_SPLIT_SEED)
     return _LOADERS[dataset](n_train, n_val, seed)
 
 

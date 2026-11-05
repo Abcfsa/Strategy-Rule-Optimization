@@ -81,7 +81,7 @@ DEFAULTS = {
     "IFBENCH_PATH": "",
     "LIVEBENCH_PATH": "",
     "PUPA_PATH": "",        # 可指到具体 csv（如 PUPA_TNB.csv）；空=默认 PUPA_New.csv
-    "AIME_GEPA_SPLIT": "false",
+    "GEPA_SPLIT": "false",
 }
 
 
@@ -151,7 +151,7 @@ class Config:
     ifbench_path: str = ""
     livebench_path: str = ""
     pupa_path: str = ""
-    aime_gepa_split: bool = False
+    gepa_split: bool = False
 
     @property
     def has_api_key(self) -> bool:
@@ -214,7 +214,7 @@ class Config:
             ifbench_path=g("IFBENCH_PATH"),
             livebench_path=g("LIVEBENCH_PATH"),
             pupa_path=g("PUPA_PATH"),
-            aime_gepa_split=_parse_bool(g("AIME_GEPA_SPLIT")),
+            gepa_split=_parse_bool(g("GEPA_SPLIT")),
         )
 
 

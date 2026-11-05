@@ -156,7 +156,7 @@ def run_dataset(
     dataset: str, n_train: int, n_val: int, n_iters: int,
     seed: int, dynamic_learning: bool, output_dir: str | None,
     evo_mode: str, train_retrieve_ctx: bool, test_use_patterns: bool,
-    aime_gepa_split: bool = False, pattern_gen_mode: str | None = None,
+    gepa_split: bool = False, pattern_gen_mode: str | None = None,
     test_match_method: str | None = None, reflect_wrong_only: bool | None = None,
     regularized_verify: bool | None = None, npo_window: int | None = None,
     cross_aware_gen: bool | None = None,
@@ -175,7 +175,7 @@ def run_dataset(
 
     print(f"########## Loading dataset: {dataset} ##########")
     train, val = load(dataset, n_train=n_train, n_val=n_val, seed=seed,
-                      gepa_split=aime_gepa_split)
+                      gepa_split=gepa_split)
     print(f"  train: {len(train)} samples | val: {len(val)} samples")
 
     engine = SROEngine(
@@ -192,7 +192,7 @@ def run_dataset(
         npo_window=npo_window,
         cross_aware_gen=cross_aware_gen,
     )
-    engine.set_dataset(dataset, gepa_split=aime_gepa_split)   # inject the matching grader
+    engine.set_dataset(dataset, gepa_split=gepa_split)   # inject the matching grader
 
     # Phase 0：初始 prompt 基线（策略=初始版本、KB=空时硬答 val）。
     # 跳过时 summary 的 initial_prompt 字段记 null。
@@ -235,7 +235,7 @@ def run_dataset(
         "seed": seed, "dynamic_learning": dynamic_learning,
         "test_use_patterns": test_use_patterns,
         "evo_mode": evo_mode, "train_retrieve_ctx": train_retrieve_ctx,
-        "aime_gepa_split": aime_gepa_split,
+        "gepa_split": gepa_split,
         "pattern_gen_mode": engine.pattern_gen_mode,
         "test_match_method": engine.test_match_method,
         "reflect_wrong_only": engine.reflect_wrong_only,
@@ -294,9 +294,11 @@ def main() -> None:
     parser.add_argument("--no-train-ctx", dest="train_retrieve_ctx",
                         action="store_false",
                         help="disable KB retrieval during training")
-    parser.add_argument("--aime-gepa-split", action="store_true",
-                        default=cfg.aime_gepa_split,
-                        help="AIME only: replicate GEPA init_dataset() split (seed=0, half/half, ### answer prefix)")
+    parser.add_argument("--gepa-split", action="store_true",
+                        default=cfg.gepa_split,
+                        help="all datasets: replicate GEPA-protocol splits, ignoring --n-train/--n-val/--seed "
+                             "(fixed seed=0; aime=half/half+### prefix, hotpotqa/gsm8k/math/math500/ifbench=150/300, "
+                             "livebench=3-way equal ~133/133, pupa=positional 111/111)")
     parser.add_argument("--pattern-gen-mode", choices=["basic", "rich"],
                         default=None,
                         help="short-term pattern generation mode: basic=max 6 patterns/reflect (default from .env), "
@@ -340,7 +342,7 @@ def main() -> None:
         run_dataset(args.dataset, args.n_train, args.n_val, args.n_iters,
                     args.seed, args.dynamic_learning, args.output_dir,
                     args.evo_mode, args.train_retrieve_ctx, args.test_use_patterns,
-                    args.aime_gepa_split, args.pattern_gen_mode,
+                    args.gepa_split, args.pattern_gen_mode,
                     args.test_match_method, args.reflect_wrong_only,
                     args.regularized_verify, args.npo_window,
                     args.cross_aware_gen,
