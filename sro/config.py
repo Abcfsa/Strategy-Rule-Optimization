@@ -78,6 +78,9 @@ DEFAULTS = {
     "MATH500_PATH": "",
     "HOTPOTQA_PATH": "",
     "AIME_PATH": "",
+    "IFBENCH_PATH": "",
+    "LIVEBENCH_PATH": "",
+    "PUPA_PATH": "",        # 可指到具体 csv（如 PUPA_TNB.csv）；空=默认 PUPA_New.csv
     "AIME_GEPA_SPLIT": "false",
 }
 
@@ -145,6 +148,9 @@ class Config:
     math500_path: str = ""
     hotpotqa_path: str = ""
     aime_path: str = ""
+    ifbench_path: str = ""
+    livebench_path: str = ""
+    pupa_path: str = ""
     aime_gepa_split: bool = False
 
     @property
@@ -205,6 +211,9 @@ class Config:
             math500_path=g("MATH500_PATH"),
             hotpotqa_path=g("HOTPOTQA_PATH"),
             aime_path=g("AIME_PATH"),
+            ifbench_path=g("IFBENCH_PATH"),
+            livebench_path=g("LIVEBENCH_PATH"),
+            pupa_path=g("PUPA_PATH"),
             aime_gepa_split=_parse_bool(g("AIME_GEPA_SPLIT")),
         )
 
