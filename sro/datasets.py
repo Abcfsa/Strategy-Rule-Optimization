@@ -9,8 +9,9 @@
       n_test=0 时 train/val 输出与旧版 _shuffle_split 完全一致）
     - HotpotQA 用原生 train/dev 文件：train 文件出 train，dev 文件出 val+test
     - GSM8K / MATH 的 test 用官方 test 文件（不参与 train/val 池）
-    - AIME 用 aimo-validation-aime 作为 train+val 池；gepa_split 时 test 用
-      MathArena___aime_2025（GEPA 协议：AIME 2025 的 30 题独立 test）
+    - AIME 用 aimo-validation-aime 作为 train+val 池；test 恒用
+      MathArena___aime_2025（GEPA 协议：AIME 2025 的 30 题独立 test，
+      gepa_split 与否皆然——2022-24 训练、2025 测试的时间外推划分）
     - gepa_split=True 时对所有数据集生效：忽略 n_train/n_val/n_test/seed，
       改用 GEPA_SPLIT_SIZES 固定规模 + seed=0（详见 load() docstring）
     - MATH-500 / IFBench / LiveBench 是纯 test 集（无 train 标注），
@@ -263,7 +264,10 @@ def _load_aime(n_train: int, n_val: int, n_test: int, seed: int,
       论文中每题 5 次尝试取 pass@1——重复评估在 engine/main 层做，loader 只供题）
     - 三集答案统一加 "### " 前缀（GEPA 的答案格式）
 
-    gepa_split=False 时：aimo 池 shuffle(seed) 切 train/val/test 三段。
+    gepa_split=False 时：train/val 从 aimo 池 shuffle(seed) 切分；test 同样
+    用 MathArena___aime_2025（2022-24 训练、2025 测试的时间外推划分在两种
+    模式下都成立），取前 n_test 题（池仅 30 题，n_test>=30 时全取），答案
+    保持裸格式（无 ### 前缀，与旧行为一致）。
     """
     items = _aime_pool_items()
 
@@ -279,7 +283,9 @@ def _load_aime(n_train: int, n_val: int, n_test: int, seed: int,
             s.answer = prefix + s.answer
         return train, val, test
 
-    return _shuffle_split3(items, n_train, n_val, n_test, seed)
+    train, val, _ = _shuffle_split3(items, n_train, n_val, 0, seed)
+    test = _take_first(_aime_2025_test_items(), n_test, seed)
+    return train, val, test
 
 
 def _load_hotpotqa(n_train: int, n_val: int, n_test: int, seed: int):
@@ -535,7 +541,9 @@ def load(dataset: str, n_train: int = 50, n_val: int = 30, n_test: int = 150,
     gepa_split: True 时对**所有数据集**生效，复刻 GEPA 协议划分——忽略
     n_train / n_val / n_test / seed，改用 GEPA_SPLIT_SIZES 与 GEPA_SPLIT_SEED：
       - aime:      Random(0) 打乱 aimo 池对半切 45/45 + "### " 前缀；
-                   test = MathArena___aime_2025 全部 30 题（GEPA 独立 test 协议）
+                   test = MathArena___aime_2025 全部 30 题（GEPA 独立 test 协议）。
+                   非 gepa_split 时 aime 的 test 同样取 aime_2025（前 n_test 题，
+                   裸答案格式）——两种模式 test 同源
       - pupa:      原始位置划分，不 shuffle，111/111/221
       - livebench: Random(0) 打乱后三等分 ~133/133/134（GEPA LiveBench 协议）
       - hotpotqa:  train 文件取 150；dev 文件 shuffle(0) 后 300 val + 300 test
