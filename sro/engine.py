@@ -686,6 +686,38 @@ class SROEngine:
     # 阶段二：测试与推理
     # ===================================================================
 
+    def run_eval_no_patterns(self, val: list[TrainSample]) -> list[dict]:
+        """Phase 2b 对照组：同 strategy、关 pattern 注入和动态学习，重测 val。
+
+        用于隔离 pattern 注入的净贡献：Phase 2 成绩 − Phase 2b 成绩 = pattern 贡献。
+        临时关闭 test_use_patterns 和 dynamic_learning，跑完恢复原状态。
+        """
+        saved_patterns, saved_dyn = self.test_use_patterns, self.dynamic_learning
+        self.test_use_patterns = False
+        self.dynamic_learning = False
+        try:
+            results = []
+            correct = 0
+            for i, sample in enumerate(val, 1):
+                trace = self.task_lm.run(
+                    sample.problem, gold_answer=sample.answer,
+                    answer_type=sample.answer_type)
+                ok = trace.result.correct
+                correct += ok
+                results.append({
+                    "index": i,
+                    "problem": sample.problem,
+                    "prediction": trace.result.answer,
+                    "gold": sample.answer,
+                    "correct": bool(ok),
+                })
+        finally:
+            self.test_use_patterns = saved_patterns
+            self.dynamic_learning = saved_dyn
+        acc = correct / len(val) if val else 0.0
+        print(f"[Phase 2b] no-pattern rerun: {correct}/{len(val)} = {acc:.2%}")
+        return results
+
     def run_initial_baseline(self, val: list[TrainSample]) -> list[dict]:
         """初始 prompt 基线：训练前用当前（初始）策略直接硬答 val。
 

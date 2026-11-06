@@ -42,6 +42,7 @@ DEFAULTS = {
     "SEED": "42",
     "DYNAMIC_LEARNING": "true",
     "TEST_USE_PATTERNS": "true",
+    "TEST_NO_PATTERN_RERUN": "false",
     # ---- 进化模式参数（classic / gepa / npo）----
     "EVO_MODE": "classic",
     "TRAIN_RETRIEVE_CTX": "true",
@@ -117,6 +118,7 @@ class Config:
     seed: int
     dynamic_learning: bool
     test_use_patterns: bool
+    test_no_pattern_rerun: bool
     evo_mode: str
     train_retrieve_ctx: bool
     max_metric_calls: int
@@ -187,6 +189,7 @@ class Config:
             seed=int(g("SEED")),
             dynamic_learning=_parse_bool(g("DYNAMIC_LEARNING")),
             test_use_patterns=_parse_bool(g("TEST_USE_PATTERNS")),
+            test_no_pattern_rerun=_parse_bool(g("TEST_NO_PATTERN_RERUN")),
             evo_mode=g("EVO_MODE"),
             train_retrieve_ctx=_parse_bool(g("TRAIN_RETRIEVE_CTX")),
             max_metric_calls=int(g("MAX_METRIC_CALLS")),
