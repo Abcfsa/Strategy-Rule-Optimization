@@ -30,7 +30,7 @@ JSON 编码（见 grading.py 各 judger 的 gold 约定）；engine 对这两类
 
 数据集本地路径（相对 SRO 仓库根，可在 config 覆盖）：
     ../gsm8k/main/   ../MATH/   ../MATH-500/   ../HotpotQA/raw/   ../AIME/
-    ../IFBench/IFBench_test/   ../livebench_instruction_following/
+    ../IFBench_modelscope/   ../livebench_instruction_following/
     ../PAPILLON/pupa/
 """
 
@@ -120,7 +120,7 @@ def _data_dir(name: str) -> Path:
         "math500": repo_root.parent / "MATH-500",
         "hotpotqa": repo_root.parent / "HotpotQA" / "raw",
         "aime": repo_root.parent / "AIME",
-        "ifbench": repo_root.parent / "IFBench" / "IFBench_test",
+        "ifbench": repo_root.parent / "IFBench_modelscope",
         "livebench": repo_root.parent / "livebench_instruction_following",
         "pupa": repo_root.parent / "PAPILLON" / "pupa",
     }
@@ -365,37 +365,84 @@ def _encode_if_gold(prompt: str, id_list, kwargs_list) -> str:
 
 
 def _load_ifbench(n_train: int, n_val: int, n_test: int, seed: int):
-    """IFBench_test：单轮 prompt + 约束列表（OOD 约束为主）。
+    """IFBench：双数据源划分（对齐 GEPA 论文）。
+
+    train/val 来自 IF_multi_constraints_upto5（IF-RLVR 训练集，95373 条），
+    test 来自 IFBench_test（OOD 约束测试集，300 条）。
+
+    gepa_split=True 时固定 150/300/294（GEPA 论文协议）；
+    gepa_split=False 时按 n_train/n_val/n_test shuffle 切分。
 
     answer_type=verifiable，answer=约束 gold JSON；problem 用 prompt。
-    本地仅有 IFBench 发布集（GEPA 的 train/val 源 IF-RLVR Train 不在本地），
-    故 train/val/test 都从发布集切；gepa_split 请求 150/300/294 时池不足，
-    按 _shuffle_split3 的 clamp 自动降级（剩余池 val/test 平分）。
+
+    ifbench_path 应指向数据集根目录（如 ../IFBench_modelscope），
+    根目录下需包含：
+    - IF_multi_constraints_upto5/data/train-*.parquet
+    - IFBench_test/data/train-*.parquet
     """
     d = _data_dir("ifbench")
-    pq_path = d / "data" / "train-00000-of-00001.parquet"
-    if not pq_path.exists():
-        raise FileNotFoundError(f"IFBench parquet not found: {pq_path}")
-    rows = _read_parquet_rows(pq_path)
-    items: list[TrainSample] = []
-    for it in rows:
+
+    # ifbench_path 可能指向根目录或 IFBench_test 子目录
+    # 统一推断根目录
+    if d.name == "IFBench_test":
+        root = d.parent
+    else:
+        root = d
+
+    # 1. 加载训练集（IF_multi_constraints_upto5）
+    train_pq = root / "IF_multi_constraints_upto5" / "data" / "train-00000-of-00001.parquet"
+    if not train_pq.exists():
+        raise FileNotFoundError(
+            f"IF-RLVR training parquet not found: {train_pq}\n"
+            f"IFBench requires both IFBench_test (test) and "
+            f"IF_multi_constraints_upto5 (train/val) datasets in {root}"
+        )
+    train_rows = _read_parquet_rows(train_pq)
+    train_items: list[TrainSample] = []
+    for it in train_rows:
         prompt = it.get("prompt", "")
         ids = it.get("instruction_id_list", [])
         kwargs = it.get("kwargs", [])
         if not prompt or not ids:
             continue
-        # ids 与 kwargs 必须一一对应（错位会让 judger 抛环境错，加载期就拦下）
+        if len(ids) != len(kwargs):
+            raise ValueError(
+                f"IF-RLVR row key={it.get('key')!r}: {len(ids)} instruction ids "
+                f"vs {len(kwargs)} kwargs — data is malformed"
+            )
+        train_items.append(TrainSample(
+            problem=prompt,
+            answer=_encode_if_gold(prompt, ids, kwargs),
+            answer_type="verifiable",
+        ))
+
+    # 2. 加载测试集（IFBench_test）
+    test_pq = root / "IFBench_test" / "data" / "train-00000-of-00001.parquet"
+    if not test_pq.exists():
+        raise FileNotFoundError(f"IFBench test parquet not found: {test_pq}")
+    test_rows = _read_parquet_rows(test_pq)
+    test_items: list[TrainSample] = []
+    for it in test_rows:
+        prompt = it.get("prompt", "")
+        ids = it.get("instruction_id_list", [])
+        kwargs = it.get("kwargs", [])
+        if not prompt or not ids:
+            continue
         if len(ids) != len(kwargs):
             raise ValueError(
                 f"IFBench row key={it.get('key')!r}: {len(ids)} instruction ids "
                 f"vs {len(kwargs)} kwargs — data is malformed"
             )
-        items.append(TrainSample(
+        test_items.append(TrainSample(
             problem=prompt,
             answer=_encode_if_gold(prompt, ids, kwargs),
             answer_type="verifiable",
         ))
-    return _shuffle_split3(items, n_train, n_val, n_test, seed)
+
+    # 3. 划分：train/val 来自 train_items，test 来自 test_items
+    train, val, _ = _shuffle_split3(train_items, n_train, n_val, 0, seed)
+    test = _take_first(test_items, n_test, seed)
+    return train, val, test
 
 
 def _load_livebench(n_train: int, n_val: int, n_test: int, seed: int):

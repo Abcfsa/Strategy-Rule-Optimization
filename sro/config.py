@@ -62,6 +62,8 @@ DEFAULTS = {
     "REFLECT_WRONG_ONLY": "false",  # true=STEVE式错误驱动：只用错误轨迹反思；false=错误+正确都用
     # ---- 跨感知生成（反思提示互相注入对方状态）----
     "CROSS_AWARE_GEN": "false",  # true=pattern提示看当前策略、strategy提示看KB规律（分工去重）
+    # 非空=替代默认起始 prompt（如 GEPA 原版 INITIAL_WRITER_PROMPT）
+    "INITIAL_PROMPT": "",
     # ---- STEVE 正则化验证（第二机制）----
     "REGULARIZED_VERIFY": "false",  # true=GEPA候选接受前加保留集回归门控(λ_t=1.5+0.1(t-1))
     # ---- 测试时匹配方法 ----
@@ -136,6 +138,7 @@ class Config:
     reflect_wrong_only: bool
     # 跨感知生成
     cross_aware_gen: bool
+    initial_prompt: str
     # STEVE 正则化验证门控
     regularized_verify: bool
     # 测试时匹配方法
@@ -203,6 +206,7 @@ class Config:
             pattern_dedup_threshold=float(g("PATTERN_DEDUP_THRESHOLD")),
             reflect_wrong_only=_parse_bool(g("REFLECT_WRONG_ONLY")),
             cross_aware_gen=_parse_bool(g("CROSS_AWARE_GEN")),
+            initial_prompt=g("INITIAL_PROMPT").strip(),
             regularized_verify=_parse_bool(g("REGULARIZED_VERIFY")),
             test_match_method=g("TEST_MATCH_METHOD"),
             llm_match_recall_k=int(g("LLM_MATCH_RECALL_K")),
