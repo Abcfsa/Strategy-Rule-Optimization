@@ -201,9 +201,14 @@ class _OpenAIClient:
                 else:
                     kwargs["reasoning_effort"] = "medium"
             else:
-                # qwen3（非 qwen3.）默认开思考，非流式必须关；glm 同理关 reasoning
+                # qwen3（非 qwen3.）默认开思考，必须显式关；glm 同理关 reasoning。
+                # qwen3 关思考用 reasoning_effort="none"：ollama /v1 实测
+                # enable_thinking=False（走流式）并不关思考——reasoning_content
+                # 照常吐出、计入 max_tokens，4096 上限下 AIME 类长题被截断率
+                # 69-90%。reasoning_effort="none" 真正关闭（同题 4096 打满 →
+                # 1191 token 正常收尾），且不触发流式路径。
                 if "qwen3" in ml and "qwen3." not in ml:
-                    self._inject(kwargs, "enable_thinking", False)
+                    kwargs["reasoning_effort"] = "none"
                 elif "glm" in ml:
                     self._inject(kwargs, "reasoning", False)
         # 上下文长度
