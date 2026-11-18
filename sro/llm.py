@@ -102,26 +102,40 @@ class TrainSample:
 
 
 class _OpenAIClient:
-    """OpenAI 兼容客户端单例。无 key 或无 openai 库时 is_real=False。"""
+    """OpenAI 兼容客户端。支持自定义端点和密钥。
 
-    def __init__(self) -> None:
+    无 key 或无 openai 库时 is_real=False，自动回退占位实现。
+    可创建多个实例以支持不同端点（如 task vs reflection）。
+    """
+
+    def __init__(self, base_url: str = None, api_key: str = None,
+                 timeout: float = None) -> None:
         self._client = None
         self.is_real = False
         cfg = get_config()
         self._cfg = cfg
         self._max_retries = cfg.max_retries
         self._retry_backoff_base = cfg.retry_backoff_base
-        if not cfg.has_api_key:
+
+        # 使用传入参数或从 config 读取
+        self._base_url = base_url or cfg.openai_base_url
+        self._api_key = api_key or cfg.openai_api_key
+        self._timeout = timeout or cfg.task_timeout
+
+        # 检查是否有有效密钥
+        has_key = bool(self._api_key) and not self._api_key.startswith("sk-your")
+        if not has_key:
             return
+
         try:
             from openai import OpenAI  # type: ignore
             from httpx import Timeout
             # httpx.Timeout 需全四参数，否则 ValueError
             self._client = OpenAI(
-                base_url=cfg.openai_base_url,
-                api_key=cfg.openai_api_key,
-                timeout=Timeout(cfg.task_timeout, connect=30.0,
-                                read=cfg.task_timeout, write=30.0, pool=10.0),
+                base_url=self._base_url,
+                api_key=self._api_key,
+                timeout=Timeout(self._timeout, connect=30.0,
+                                read=self._timeout, write=30.0, pool=10.0),
             )
             self.is_real = True
         except Exception:
@@ -334,14 +348,40 @@ class _OpenAIClient:
         return list(resp.data[0].embedding)
 
 
-_client: Optional[_OpenAIClient] = None
+_task_client: Optional[_OpenAIClient] = None
+_reflection_client: Optional[_OpenAIClient] = None
+
+
+def _get_task_client() -> _OpenAIClient:
+    """获取任务模型客户端（使用 OPENAI_BASE_URL / OPENAI_API_KEY）。"""
+    global _task_client
+    if _task_client is None:
+        cfg = get_config()
+        _task_client = _OpenAIClient(
+            base_url=cfg.openai_base_url,
+            api_key=cfg.openai_api_key,
+            timeout=cfg.task_timeout,
+        )
+    return _task_client
+
+
+def _get_reflection_client() -> _OpenAIClient:
+    """获取反思模型客户端（使用 REFLECTION_BASE_URL / REFLECTION_API_KEY，
+    若未配置则继承任务模型端点）。"""
+    global _reflection_client
+    if _reflection_client is None:
+        cfg = get_config()
+        _reflection_client = _OpenAIClient(
+            base_url=cfg.reflection_base_url,
+            api_key=cfg.reflection_api_key,
+            timeout=cfg.reflection_timeout,
+        )
+    return _reflection_client
 
 
 def _get_client() -> _OpenAIClient:
-    global _client
-    if _client is None:
-        _client = _OpenAIClient()
-    return _client
+    """向后兼容：返回任务模型客户端。"""
+    return _get_task_client()
 
 
 def _hash_embed(text: str, dim: int = 64) -> list[float]:
@@ -521,7 +561,7 @@ class TaskLM:
 
     def _call_llm(self, system: str, user: str) -> str:
         """真实模型调用。无 key 时由 _OpenAIClient 自动回退占位。"""
-        return _get_client().chat(
+        return _get_task_client().chat(
             self.model, system, user, timeout=self.timeout,
             temperature=self.temperature, max_tokens=self.max_tokens,
             enable_thinking=self.enable_thinking,
@@ -790,7 +830,7 @@ class TaskLM:
 
         有 key 时让 LLM 改写当前策略；无 key 时占位拼接。
         """
-        c = _get_client()
+        c = _get_task_client()
         out: list[Strategy] = []
         if c.is_real:
             for i in range(candidates):
@@ -869,7 +909,7 @@ class ReflectionLM:
 
         model: 可选模型名覆盖（默认 self.model）。
         """
-        return _get_client().chat(
+        return _get_reflection_client().chat(
             model or self.model, system, user, timeout=self.timeout,
             temperature=self.temperature, max_tokens=self.max_tokens,
             enable_thinking=self.enable_thinking,
@@ -1019,7 +1059,7 @@ class ReflectionLM:
         wrong = [t for t in traces if not t.result.correct]
         if self.reflect_wrong_only:
             correct = []   # 错误驱动：不从正确轨迹提取规律
-        c = _get_client()
+        c = _get_reflection_client()
 
         patterns: list[Example] = []
         pattern_note = self._pattern_awareness_note(strategy_text)
@@ -1089,7 +1129,7 @@ class ReflectionLM:
         if self.reflect_wrong_only:
             correct = []   # 错误驱动：不从正确轨迹提取规律
         cap = max(1, self.pattern_max_traces)
-        c = _get_client()
+        c = _get_reflection_client()
 
         patterns: list[Example] = []
         pattern_note = self._pattern_awareness_note(strategy_text)
@@ -1200,7 +1240,7 @@ class ReflectionLM:
         """
         if not candidates:
             return []
-        c = _get_client()
+        c = _get_reflection_client()
         if not c.is_real:
             return None  # 占位模式无法做 LLM 判断，让调用方回落 vector
 

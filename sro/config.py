@@ -20,6 +20,8 @@ except Exception:
 DEFAULTS = {
     "OPENAI_BASE_URL": "https://api.openai.com/v1",
     "OPENAI_API_KEY": "",
+    "REFLECTION_BASE_URL": "",  # 空 = 继承 OPENAI_BASE_URL
+    "REFLECTION_API_KEY": "",   # 空 = 继承 OPENAI_API_KEY
     "TASK_MODEL": "gpt-4o-mini",
     "REFLECTION_MODEL": "gpt-4o-mini",
     "TASK_TIMEOUT": "200",
@@ -98,6 +100,8 @@ def _parse_bool(s: str) -> bool:
 class Config:
     openai_base_url: str
     openai_api_key: str
+    reflection_base_url: str  # 反思模型端点（空则继承 openai_base_url）
+    reflection_api_key: str   # 反思模型密钥（空则继承 openai_api_key）
     task_model: str
     reflection_model: str
     task_timeout: float
@@ -169,9 +173,20 @@ class Config:
         if _HAS_DOTENV:
             load_dotenv()  # 默认从 ./.env 读
         g = lambda k: os.getenv(k, DEFAULTS[k])
+
+        # 加载基础配置
+        openai_base_url = g("OPENAI_BASE_URL")
+        openai_api_key = g("OPENAI_API_KEY")
+
+        # 反思端点：显式配置优先，否则继承主端点
+        reflection_base_url = g("REFLECTION_BASE_URL") or openai_base_url
+        reflection_api_key = g("REFLECTION_API_KEY") or openai_api_key
+
         return cls(
-            openai_base_url=g("OPENAI_BASE_URL"),
-            openai_api_key=g("OPENAI_API_KEY"),
+            openai_base_url=openai_base_url,
+            openai_api_key=openai_api_key,
+            reflection_base_url=reflection_base_url,
+            reflection_api_key=reflection_api_key,
             task_model=g("TASK_MODEL"),
             reflection_model=g("REFLECTION_MODEL"),
             task_timeout=float(g("TASK_TIMEOUT")),
