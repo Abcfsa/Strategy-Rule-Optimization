@@ -69,6 +69,7 @@ class SROEngine:
         initial_prompt: Optional[str] = None,  # None=读 .env；替代默认起始 strategy 文本
         regularized_verify: Optional[bool] = None,  # None=读 .env；STEVE正则化验证门控
         npo_window: Optional[int] = None,           # None=读 .env；NPO滑动窗口W
+        extract_patterns_on_reject: Optional[bool] = None,  # None=读 .env；GEPA拒绝时仍提取patterns
     ) -> None:
         from .config import get_config
         cfg = get_config()
@@ -104,6 +105,10 @@ class SROEngine:
         # NPO 滑动窗口 W（仅 npo 模式生效）
         self.npo_window = (cfg.npo_window if npo_window is None
                            else max(1, int(npo_window)))
+        # GEPA 模式：prompt 被拒绝时是否仍提取 patterns（默认 False）
+        self.extract_patterns_on_reject = (cfg.extract_patterns_on_reject
+                                           if extract_patterns_on_reject is None
+                                           else bool(extract_patterns_on_reject))
         self.test_match_method = (test_match_method or cfg.test_match_method).lower()
         if self.test_match_method not in ("vector", "llm", "random"):
             raise ValueError(
@@ -469,6 +474,19 @@ class SROEngine:
                     if verbose:
                         print(f"[Reject] No improvement"
                               f" ({new_sum} <= {old_sum}).")
+                    # 从被拒绝的候选中仍提取 patterns（如果启用）
+                    if self.extract_patterns_on_reject:
+                        patterns, _ = self.reflection_lm.reflect(
+                            old_traces + new_traces,
+                            strategy_text=(parent.text
+                                           if self.cross_aware_gen else None),
+                            kb_patterns=(self._kb_pattern_texts()
+                                         if self.cross_aware_gen else None),
+                        )
+                        self.kb.add_patterns(patterns)
+                        if verbose:
+                            print(f"  [Pattern] Extracted {len(patterns)} patterns"
+                                  f" from rejected candidate")
                     continue
 
                 # 2g) accept -> full val eval -> gate -> update Pareto
@@ -499,6 +517,19 @@ class SROEngine:
                             print(f"[Gate] Reject: improvement {improvement:.2f}"
                                   f" - {lam:.1f} * regression {regression:.2f}"
                                   f" ({reg}/{len(pres_idx)} lost) <= 0")
+                        # 从被拒绝的候选中仍提取 patterns（如果启用）
+                        if self.extract_patterns_on_reject:
+                            patterns, _ = self.reflection_lm.reflect(
+                                old_traces + new_traces,
+                                strategy_text=(new_strat.text
+                                               if self.cross_aware_gen else None),
+                                kb_patterns=(self._kb_pattern_texts()
+                                             if self.cross_aware_gen else None),
+                            )
+                            self.kb.add_patterns(patterns)
+                            if verbose:
+                                print(f"  [Pattern] Extracted {len(patterns)} patterns"
+                                      f" from gate-rejected candidate")
                         continue
                     if verbose:
                         print(f"[Gate] Pass: improvement {improvement:.2f},"
