@@ -33,6 +33,11 @@ DEFAULTS = {
     "REFLECTION_MAX_TOKENS": "2048",
     "TASK_ENABLE_THINKING": "false",
     "REFLECTION_ENABLE_THINKING": "false",
+    # 思考预算（仅 vLLM 端点生效；0=不限制，max_tokens 为总量上限）
+    # >0 且 < max_tokens 时走两段式：思考段封顶 budget，超预算注入官方
+    # 提前收尾指令强制出答案（Qwen3 budget 机制的客户端实现）
+    "TASK_THINKING_BUDGET": "0",
+    "REFLECTION_THINKING_BUDGET": "0",
     "TASK_MAX_CONTEXT_LEN": "0",
     "REFLECTION_MAX_CONTEXT_LEN": "0",
     "EXTRA_PARAMS": "",
@@ -114,6 +119,8 @@ class Config:
     reflection_max_tokens: int
     task_enable_thinking: bool
     reflection_enable_thinking: bool
+    task_thinking_budget: int
+    reflection_thinking_budget: int
     task_max_context_len: int
     reflection_max_context_len: int
     extra_params: str
@@ -199,6 +206,8 @@ class Config:
             reflection_max_tokens=int(g("REFLECTION_MAX_TOKENS")),
             task_enable_thinking=_parse_bool(g("TASK_ENABLE_THINKING")),
             reflection_enable_thinking=_parse_bool(g("REFLECTION_ENABLE_THINKING")),
+            task_thinking_budget=int(g("TASK_THINKING_BUDGET")),
+            reflection_thinking_budget=int(g("REFLECTION_THINKING_BUDGET")),
             task_max_context_len=int(g("TASK_MAX_CONTEXT_LEN")),
             reflection_max_context_len=int(g("REFLECTION_MAX_CONTEXT_LEN")),
             extra_params=g("EXTRA_PARAMS"),

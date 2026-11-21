@@ -199,6 +199,8 @@ def run_dataset(
     reflection_temperature: float | None = None,
     task_max_tokens: int | None = None,
     reflection_max_tokens: int | None = None,
+    task_thinking_budget: int | None = None,
+    reflection_thinking_budget: int | None = None,
     skip_initial_baseline: bool = False,
 ) -> None:
     """Load a real dataset and run the two-phase loop, then save outputs.
@@ -257,6 +259,8 @@ def run_dataset(
         reflection_temperature=reflection_temperature,
         task_max_tokens=task_max_tokens,
         reflection_max_tokens=reflection_max_tokens,
+        task_thinking_budget=task_thinking_budget,
+        reflection_thinking_budget=reflection_thinking_budget,
     )
     engine.set_dataset(dataset, gepa_split=gepa_split)   # inject the matching grader
 
@@ -343,6 +347,8 @@ def run_dataset(
         "reflection_temperature": engine.reflection_lm.temperature,
         "task_max_tokens": engine.task_lm.max_tokens,
         "reflection_max_tokens": engine.reflection_lm.max_tokens,
+        "task_thinking_budget": engine.task_lm.thinking_budget,
+        "reflection_thinking_budget": engine.reflection_lm.thinking_budget,
     }
     if output_dir is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -484,6 +490,15 @@ def main() -> None:
     parser.add_argument("--reflection-max-tokens", type=int, default=None,
                         help=f"ReflectionLM max output tokens per call (default from .env: "
                              f"{cfg.reflection_max_tokens})")
+    parser.add_argument("--task-thinking-budget", type=int, default=None,
+                        help=f"TaskLM thinking budget in tokens (vLLM endpoints only; "
+                             f"0=unlimited, total capped by --task-max-tokens; >0 forces "
+                             f"answer after budget via Qwen3 official early-close injection) "
+                             f"(default from .env: {cfg.task_thinking_budget})")
+    parser.add_argument("--reflection-thinking-budget", type=int, default=None,
+                        help=f"ReflectionLM thinking budget (same semantics as "
+                             f"--task-thinking-budget) (default from .env: "
+                             f"{cfg.reflection_thinking_budget})")
     parser.add_argument("--skip-initial-baseline", action="store_true",
                         help="skip the Phase 0 initial-prompt baseline on val "
                              "(saves |val| extra LLM calls; summary fields become null)")
@@ -506,6 +521,7 @@ def main() -> None:
                     args.extract_patterns_on_reject,
                     args.task_temperature, args.reflection_temperature,
                     args.task_max_tokens, args.reflection_max_tokens,
+                    args.task_thinking_budget, args.reflection_thinking_budget,
                     args.skip_initial_baseline)
     else:
         parser.print_help()

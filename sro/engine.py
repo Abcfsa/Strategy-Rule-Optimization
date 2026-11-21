@@ -74,19 +74,23 @@ class SROEngine:
         reflection_temperature: Optional[float] = None,  # None=读 .env
         task_max_tokens: Optional[int] = None,      # None=读 .env；CLI 覆盖 TaskLM 输出上限
         reflection_max_tokens: Optional[int] = None,  # None=读 .env
+        task_thinking_budget: Optional[int] = None,   # None=读 .env；vLLM 思考预算
+        reflection_thinking_budget: Optional[int] = None,  # None=读 .env
     ) -> None:
         from .config import get_config
         cfg = get_config()
         self.embedder = embedder or Embedder()
         self.task_lm = task_lm or TaskLM(
             self.embedder, temperature=task_temperature,
-            max_tokens=task_max_tokens)
+            max_tokens=task_max_tokens,
+            thinking_budget=task_thinking_budget)
         self.reflection_lm = reflection_lm or ReflectionLM(
             self.embedder, pattern_gen_mode=pattern_gen_mode,
             reflect_wrong_only=reflect_wrong_only,
             cross_aware_gen=cross_aware_gen,
             temperature=reflection_temperature,
-            max_tokens=reflection_max_tokens)
+            max_tokens=reflection_max_tokens,
+            thinking_budget=reflection_thinking_budget)
         dedup = (cfg.pattern_dedup_threshold
                  if pattern_dedup_threshold is None else pattern_dedup_threshold)
         self.kb = kb or KnowledgeBase(self.embedder, dedup_threshold=dedup)

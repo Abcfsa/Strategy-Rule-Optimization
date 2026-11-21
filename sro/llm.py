@@ -110,7 +110,7 @@ class _OpenAIClient:
     """
 
     def __init__(self, base_url: str = None, api_key: str = None,
-                 timeout: float = None) -> None:
+                 timeout: float = None, backend: str = "auto") -> None:
         self._client = None
         self.is_real = False
         cfg = get_config()
@@ -122,6 +122,14 @@ class _OpenAIClient:
         self._base_url = base_url or cfg.openai_base_url
         self._api_key = api_key or cfg.openai_api_key
         self._timeout = timeout or cfg.task_timeout
+
+        # ---- 后端类型：vllm / ollama / other ----
+        # vllm 端点行为与 ollama 有实质差异（思考开关方式、思考预算、
+        # reasoning_content 分离），按类型分派处理逻辑。
+        # backend="auto" 时按 base_url 嗅探：8000 端口 / 含 "vllm" → vllm；
+        # 11434 端口 / 含 "ollama" → ollama；否则 other（走通用 OpenAI 路径）。
+        # 显式 backend 参数优先（供测试/特殊部署覆盖）。
+        self.backend = self._detect_backend(self._base_url, backend)
 
         # 检查是否有有效密钥
         has_key = bool(self._api_key) and not self._api_key.startswith("sk-your")
@@ -142,6 +150,18 @@ class _OpenAIClient:
         except Exception:
             self._client = None
             self.is_real = False
+
+    @staticmethod
+    def _detect_backend(base_url: str, explicit: str = "auto") -> str:
+        """判定端点后端类型。explicit ∈ {vllm, ollama, other} 时直接采用。"""
+        if explicit in ("vllm", "ollama", "other"):
+            return explicit
+        u = (base_url or "").lower()
+        if "vllm" in u or ":8000" in u:
+            return "vllm"
+        if "ollama" in u or ":11434" in u:
+            return "ollama"
+        return "other"
 
     # ---- API kwargs 构建（移植自 gepa_aime_v2.build_api_kwargs）----
     @staticmethod
@@ -193,7 +213,18 @@ class _OpenAIClient:
                 or "enable_thinking" in kwargs.get("extra_body", {})
                 or "reasoning" in kwargs.get("extra_body", {}))
         ml = (model or "").lower()
-        if not _has:
+        if not _has and self.backend == "vllm":
+            # vLLM：qwen3 思考开关走 chat_template_kwargs.enable_thinking
+            # （服务端 --reasoning-parser qwen3 时思考/答案分字段返回）。
+            # ollama 的 reasoning_effort="none" hack 不适用——vLLM 对
+            # qwen3 不认 reasoning_effort，会 400 或被忽略。
+            if "qwen" in ml or "qwq" in ml:
+                eb = kwargs.setdefault("extra_body", {})
+                ctk = eb.setdefault("chat_template_kwargs", {})
+                ctk["enable_thinking"] = bool(enable_thinking)
+            elif enable_thinking:
+                kwargs["reasoning_effort"] = "medium"
+        elif not _has:
             if enable_thinking:
                 if "qwen" in ml or "qwq" in ml:
                     self._inject(kwargs, "enable_thinking", True)
@@ -217,8 +248,7 @@ class _OpenAIClient:
             self._inject(kwargs, "max_model_len", max_context_len)
         return kwargs
 
-    @staticmethod
-    def _needs_stream(kwargs: dict) -> bool:
+    def _needs_stream(self, kwargs: dict) -> bool:
         """需要走流式的情形（对齐 gepa_aime_v3._chat_complete）。
 
         - extra_body 里存在 enable_thinking 键（不论 True/False）：
@@ -228,24 +258,36 @@ class _OpenAIClient:
         - 显式 stream=True
         """
         eb = kwargs.get("extra_body") or {}
+        # 显式 stream=True 任何后端都走流式
+        if kwargs.get("stream") is True:
+            return True
+        # vLLM 非流式原生支持 thinking（无 ollama 的
+        # "enable_thinking only support stream call" 限制）
+        if getattr(self, "backend", "other") == "vllm":
+            return False
         return ("enable_thinking" in eb
-                or "reasoning" in eb
-                or kwargs.get("stream") is True)
+                or "reasoning" in eb)
 
     @staticmethod
-    def _aggregate_stream(stream) -> str:
-        """聚合流式 delta：取 content，为空则回退 reasoning_content。
+    def _aggregate_stream_full(stream) -> tuple[str, str, str]:
+        """聚合流式 delta，返回 (content, reasoning, finish_reason)。
 
         用 getattr 防 usage/role 等无 choices 字段的 chunk 抛异常
-        （对齐 gepa_aime_v3 的健壮写法）。
+        （对齐 gepa_aime_v3 的健壮写法）。finish_reason 取最后一个
+        非空值（stop / length / ...），供思考预算判定截断。
         """
         parts: list[str] = []
         reasoning_parts: list[str] = []
+        finish = ""
         for chunk in stream:
             choices = getattr(chunk, "choices", None)
             if not choices:
                 continue
-            delta = choices[0].delta
+            ch = choices[0]
+            fr = getattr(ch, "finish_reason", None)
+            if fr:
+                finish = fr
+            delta = ch.delta
             c = getattr(delta, "content", None)
             if c:
                 parts.append(c)
@@ -253,11 +295,16 @@ class _OpenAIClient:
                  or getattr(delta, "reasoning", None))
             if r:
                 reasoning_parts.append(r)
-        text = "".join(parts)
+        return "".join(parts), "".join(reasoning_parts), finish
+
+    @staticmethod
+    def _aggregate_stream(stream) -> str:
+        """旧接口：取 content，为空则回退 reasoning_content（ollama 路径）。"""
+        text, reasoning, _ = _OpenAIClient._aggregate_stream_full(stream)
         if text.strip():
             return text
         # 某些模型把全部输出放在 reasoning_content，回退保证有东西可抽答案
-        return "".join(reasoning_parts)
+        return reasoning
 
     @staticmethod
     def _is_retryable(err: Exception) -> bool:
@@ -297,15 +344,71 @@ class _OpenAIClient:
         jitter = 1.0 + _r.uniform(-0.25, 0.25)
         return base * jitter
 
+    # Qwen3 官方思考预算收尾指令（budget 到点时注入，强制基于已有思考出答案）
+    _QWEN3_BUDGET_CLOSE = (
+        "Considering the limited time by the user, I have to give the "
+        "solution based on the thinking directly now.\n</think>\n\n"
+    )
+
+    def _chat_vllm_budget(self, messages: list, kwargs: dict,
+                          budget: int, timeout) -> str:
+        """vLLM 两段式思考预算（Qwen3 官方机制的客户端实现）。
+
+        第一段：max_tokens=budget 只给思考空间；思考自然结束（finish=stop）
+        则直接返回。超预算（finish=length）则第二段用 continue_final_message
+        从 assistant 前缀续写：拼上已有思考 + 官方收尾指令，模型跳过思考
+        直接产答案，答案空间 = max_tokens - budget 有保证。
+
+        返回轨迹文本统一重组为带 think 标签的完整轨迹（服务端 parser 已
+        剥离标签），供反思器读完整推理过程。
+        """
+        total = kwargs["max_tokens"]
+        # ---- 第一段：思考预算内生成 ----
+        kw1 = dict(kwargs)
+        kw1["max_tokens"] = budget
+        resp1 = self._client.chat.completions.create(
+            messages=messages, timeout=timeout, **kw1)
+        ch1 = resp1.choices[0]
+        reasoning = getattr(ch1.message, "reasoning_content", None) or ""
+        content = ch1.message.content or ""
+        if ch1.finish_reason != "length":
+            # 思考自然收尾（或答案已出）：无需第二段
+            if reasoning:
+                return "<think>\n" + reasoning + "\n</think>\n\n" + content
+            return content
+        # ---- 第二段：注入收尾指令，续写出答案 ----
+        prefix = "<think>\n" + reasoning + "\n" + self._QWEN3_BUDGET_CLOSE
+        msgs2 = messages + [{"role": "assistant", "content": prefix}]
+        kw2 = dict(kwargs)
+        kw2["max_tokens"] = max(256, total - budget)
+        eb2 = dict(kw2.get("extra_body") or {})
+        eb2["continue_final_message"] = True
+        eb2["add_generation_prompt"] = False
+        # 续写段不再需要思考（前缀已含 </think> 闭合）
+        ctk = dict(eb2.get("chat_template_kwargs") or {})
+        if ctk:
+            ctk["enable_thinking"] = False
+            eb2["chat_template_kwargs"] = ctk
+        kw2["extra_body"] = eb2
+        resp2 = self._client.chat.completions.create(
+            messages=msgs2, timeout=timeout, **kw2)
+        answer = resp2.choices[0].message.content or ""
+        return "<think>\n" + reasoning + "\n</think>\n\n" + answer
+
     def chat(self, model: str, system: str, user: str, *,
              timeout: Optional[float] = None,
              temperature: float = 0.0, max_tokens: int = 4096,
              enable_thinking: bool = False, max_context_len: int = 0,
-             extra_params: str = "") -> str:
+             extra_params: str = "", thinking_budget: int = 0) -> str:
         """返回模型文本输出。is_real=False 时回退占位。
 
-        开启 thinking 的模型族走流式（端点硬性要求），聚合 delta.content；
-        否则非流式（现状路径不变）。
+        后端分派：
+          - ollama/other：开启 thinking 的模型族走流式（端点硬性要求），
+            聚合 delta.content；否则非流式（现状路径不变）。
+          - vllm：非流式原生支持 thinking；reasoning_content 与 content
+            分离时重组为完整 think 轨迹供反思器分析；
+            thinking_budget>0 且 <max_tokens 时走两段式预算控制
+            （_chat_vllm_budget）。
 
         可重试错误（5xx / 连接 / 限流 / 超时）自动指数退避重试，
         最多 self._max_retries 次；不可重试错误（4xx 客户端错误）直接抛。
@@ -324,6 +427,11 @@ class _OpenAIClient:
         last_err: Optional[Exception] = None
         for attempt in range(self._max_retries + 1):  # 0=首次, 1..max=重试
             try:
+                # ---- vLLM 思考预算两段式 ----
+                if (self.backend == "vllm" and enable_thinking
+                        and 0 < thinking_budget < max_tokens):
+                    return self._chat_vllm_budget(
+                        messages, kwargs, thinking_budget, timeout)
                 if self._needs_stream(kwargs):
                     kw = dict(kwargs)
                     kw["stream"] = True
@@ -332,7 +440,14 @@ class _OpenAIClient:
                     return self._aggregate_stream(stream)
                 resp = self._client.chat.completions.create(
                     messages=messages, timeout=timeout, **kwargs)
-                return resp.choices[0].message.content or ""
+                msg = resp.choices[0].message
+                content = msg.content or ""
+                # vLLM reasoning parser：思考在独立字段，重组完整轨迹
+                if self.backend == "vllm":
+                    reasoning = getattr(msg, "reasoning_content", None) or ""
+                    if reasoning:
+                        return "<think>\n" + reasoning + "\n</think>\n\n" + content
+                return content
             except Exception as e:
                 last_err = e
                 if not self._is_retryable(e):
@@ -545,11 +660,16 @@ class TaskLM:
 
     def __init__(self, embedder: Optional[Embedder] = None,
                  temperature: Optional[float] = None,
-                 max_tokens: Optional[int] = None) -> None:
+                 max_tokens: Optional[int] = None,
+                 thinking_budget: Optional[int] = None) -> None:
         cfg = get_config()
         self.strategy: Strategy = Strategy(text="", version=0)
         self.model = cfg.task_model
         self.timeout = cfg.task_timeout
+        # 思考预算（仅 vLLM 端点生效；0=不限制）。显式传入优先（CLI）
+        self.thinking_budget = (cfg.task_thinking_budget
+                                if thinking_budget is None
+                                else int(thinking_budget))
         # 显式传入优先（CLI），否则读 .env/config
         self.temperature = (cfg.task_temperature if temperature is None
                             else float(temperature))
@@ -584,6 +704,7 @@ class TaskLM:
             enable_thinking=self.enable_thinking,
             max_context_len=self.max_context_len,
             extra_params=self.extra_params,
+            thinking_budget=self.thinking_budget,
         )
 
     # ---- 核心运行 ----
@@ -911,10 +1032,15 @@ class ReflectionLM:
                  reflect_wrong_only: Optional[bool] = None,
                  cross_aware_gen: Optional[bool] = None,
                  temperature: Optional[float] = None,
-                 max_tokens: Optional[int] = None) -> None:
+                 max_tokens: Optional[int] = None,
+                 thinking_budget: Optional[int] = None) -> None:
         cfg = get_config()
         self.model = cfg.reflection_model
         self.timeout = cfg.reflection_timeout
+        # 思考预算（仅 vLLM 端点生效；0=不限制）。显式传入优先（CLI）
+        self.thinking_budget = (cfg.reflection_thinking_budget
+                                if thinking_budget is None
+                                else int(thinking_budget))
         # 显式传入优先（CLI），否则读 .env/config
         self.temperature = (cfg.reflection_temperature if temperature is None
                             else float(temperature))
@@ -959,6 +1085,7 @@ class ReflectionLM:
             enable_thinking=self.enable_thinking,
             max_context_len=self.max_context_len,
             extra_params=self.extra_params,
+            thinking_budget=self.thinking_budget,
         )
 
     # ---- GEPA 辅助：静态工具方法 ----
