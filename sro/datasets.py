@@ -41,6 +41,7 @@ import json
 import os
 import random
 import re
+import zlib
 from pathlib import Path
 from typing import Optional
 
@@ -574,16 +575,116 @@ GEPA_SPLIT_SIZES = {
 GEPA_SPLIT_SEED = 0  # GEPA 固定划分 seed
 
 
-def load(dataset: str, n_train: int = 50, n_val: int = 30, n_test: int = 150,
-         seed: int = 42, gepa_split: bool = False):
-    """加载指定数据集，返回 (train, val, test) 三元组。
+def _load_single(dataset: str, n_train: int, n_val: int, n_test: int,
+                 seed: int, gepa_split: bool):
+    """单数据集加载（原 load 主体），返回未打标签的 (train, val, test)。"""
+    if gepa_split:
+        if dataset == "aime":
+            return _LOADERS[dataset](0, 0, 0, GEPA_SPLIT_SEED, gepa_split=True)
+        nt, nv, nte = GEPA_SPLIT_SIZES[dataset]
+        if dataset == "pupa":
+            return _LOADERS[dataset](nt, nv, nte, GEPA_SPLIT_SEED, positional=True)
+        return _LOADERS[dataset](nt, nv, nte, GEPA_SPLIT_SEED)
+    return _LOADERS[dataset](n_train, n_val, n_test, seed)
 
-    dataset: gsm8k / math / math500 / aime / hotpotqa / ifbench / livebench / pupa
+
+def parse_mixed_count(spec, k: int, name: str) -> list[int]:
+    """解析混合数据集的配额参数：单数字 a → [a]*k；"a,b"（恰好 k 个）→ 逐项。
+
+    接受 int 或 str；其余形式（k±1 个数、负数、非数字、空串等）一律 ValueError。
+    """
+    if isinstance(spec, int):
+        vals = [spec]
+    elif isinstance(spec, str):
+        parts = [p.strip() for p in spec.split(",")]
+        if not all(re.fullmatch(r"\d+", p) for p in parts):
+            raise ValueError(
+                f"invalid {name}={spec!r}: expect a single non-negative integer "
+                f"or exactly {k} comma-separated integers")
+        vals = [int(p) for p in parts]
+    else:
+        raise ValueError(f"invalid {name}={spec!r}: expect int or str")
+    if len(vals) == 1:
+        return vals * k
+    if len(vals) == k:
+        return vals
+    raise ValueError(
+        f"invalid {name}={spec!r}: got {len(vals)} numbers, "
+        f"expect 1 or exactly {k} (one per dataset)")
+
+
+def load_mixed(dataset: str, n_train=50, n_val=30, n_test=150,
+               seed: int = 42, gepa_split: bool = False):
+    """混合数据集（恰好 2 个，"a+b" 形式），返回带 dataset 标签的三集。
+
+    各数据集独立划分（先分后混，保证各集内部 val/test 不与自己的 train 泄漏），
+    样本打 dataset 标签，最后合并 shuffle（train/val/test 用同一 seed 派生的
+    独立 rng）。
+
+    gepa_split=True：两数据集各自按 GEPA 协议（GEPA_SPLIT_SIZES + seed=0）
+    取 train/val/test，然后分别拼接；n_train/n_val/n_test/seed 全部忽略。
+
+    gepa_split=False：配额参数各自独立解析（parse_mixed_count）：
+      - 单数字 a：每个数据集各取 a（总量 2a）
+      - "a,b"：数据集1 取 a、数据集2 取 b
+    各数据集用独立 seed 派生（seed + crc32(name)%10000，跨进程稳定），
+    避免同 seed 下各集打乱顺序耦合。
+    """
+    names = [n.strip() for n in dataset.split("+") if n.strip()]
+    if len(names) != 2:
+        raise ValueError(
+            f"mixed dataset needs exactly 2 names joined by '+': {dataset!r}")
+    unknown = [n for n in names if n not in _LOADERS]
+    if unknown:
+        raise ValueError(
+            f"unknown dataset(s) {unknown}; choose from {list(_LOADERS)}")
+    if names[0] == names[1]:
+        raise ValueError(f"mixed dataset must combine two DIFFERENT datasets: {dataset!r}")
+
+    if gepa_split:
+        quotas = None  # GEPA 协议忽略配额
+    else:
+        tr = parse_mixed_count(n_train, 2, "n_train")
+        vl = parse_mixed_count(n_val, 2, "n_val")
+        te = parse_mixed_count(n_test, 2, "n_test")
+        quotas = list(zip(tr, vl, te))
+
+    trains, vals, tests = [], [], []
+    for i, nm in enumerate(names):
+        if gepa_split:
+            t, v, e = _load_single(nm, 0, 0, 0, GEPA_SPLIT_SEED, gepa_split=True)
+        else:
+            nt, nv, nte = quotas[i]
+            # crc32 跨进程稳定（内置 hash() 因 PYTHONHASHSEED 随机化，会破坏
+            # 跨进程/对照实验的可复现性）
+            sub_seed = seed + (zlib.crc32(nm.encode()) % 10000)
+            t, v, e = _load_single(nm, nt, nv, nte, sub_seed, gepa_split=False)
+        for s in t + v + e:
+            s.dataset = nm
+        trains.extend(t)
+        vals.extend(v)
+        tests.extend(e)
+        print(f"  [mixed] {nm}: train {len(t)} | val {len(v)} | test {len(e)}")
+    random.Random(seed).shuffle(trains)
+    random.Random(seed + 1).shuffle(vals)
+    random.Random(seed + 2).shuffle(tests)
+    return trains, vals, tests
+
+
+def load(dataset: str, n_train=50, n_val=30, n_test=150,
+         seed: int = 42, gepa_split: bool = False):
+    """加载指定数据集，返回 (train, val, test) 三元组（样本带 dataset 标签）。
+
+    dataset: gsm8k / math / math500 / aime / hotpotqa / ifbench / livebench / pupa，
+             或混合 "a+b"（恰好 2 个，见 load_mixed）。
 
     三集角色（对齐 GEPA-original 协议）：
       - train：反思迭代 rollout 池（minibatch 采样源）
       - val：GEPA/NPO 的接受判据与 Pareto 评估集
       - test：优化结束后只评一次的最终报告集
+
+    n_train/n_val/n_test：单数据集时为 int；混合时可为 int（各集同额）或
+    "a,b" 字符串（逐集配额）。
 
     gepa_split: True 时对**所有数据集**生效，复刻 GEPA 协议划分——忽略
     n_train / n_val / n_test / seed，改用 GEPA_SPLIT_SIZES 与 GEPA_SPLIT_SEED：
@@ -596,17 +697,17 @@ def load(dataset: str, n_train: int = 50, n_val: int = 30, n_test: int = 150,
       - hotpotqa:  train 文件取 150；dev 文件 shuffle(0) 后 300 val + 300 test
       - gsm8k / math: train 池 shuffle(0) 切 150/300；官方 test 文件取 300
       - ifbench / math500: 纯 test 池 shuffle(0) 切三段（池不足自动 clamp）
+    混合 + gepa_split：两集各按上述协议取数后 train/val/test 分别拼接。
     """
+    if "+" in dataset:
+        return load_mixed(dataset, n_train, n_val, n_test, seed, gepa_split)
     if dataset not in _LOADERS:
         raise ValueError(f"unknown dataset '{dataset}'; choose from {list(_LOADERS)}")
-    if gepa_split:
-        if dataset == "aime":
-            return _LOADERS[dataset](0, 0, 0, GEPA_SPLIT_SEED, gepa_split=True)
-        nt, nv, nte = GEPA_SPLIT_SIZES[dataset]
-        if dataset == "pupa":
-            return _LOADERS[dataset](nt, nv, nte, GEPA_SPLIT_SEED, positional=True)
-        return _LOADERS[dataset](nt, nv, nte, GEPA_SPLIT_SEED)
-    return _LOADERS[dataset](n_train, n_val, n_test, seed)
+    train, val, test = _load_single(dataset, n_train, n_val, n_test,
+                                    seed, gepa_split)
+    for s in train + val + test:
+        s.dataset = dataset
+    return train, val, test
 
 
 # 兼容 engine.set_dataset 的旧接口

@@ -94,6 +94,7 @@ class TrainSample:
     problem: str
     answer: str
     answer_type: str = "exact"
+    dataset: str = ""                     # 来源数据集标签（混合数据集按题分派判分/格式用）
 
 
 # ---------------------------------------------------------------------------
@@ -542,13 +543,18 @@ class TaskLM:
     mutate()   : 基于反馈生成 prompt 变体（用于迭代）。
     """
 
-    def __init__(self, embedder: Optional[Embedder] = None) -> None:
+    def __init__(self, embedder: Optional[Embedder] = None,
+                 temperature: Optional[float] = None,
+                 max_tokens: Optional[int] = None) -> None:
         cfg = get_config()
         self.strategy: Strategy = Strategy(text="", version=0)
         self.model = cfg.task_model
         self.timeout = cfg.task_timeout
-        self.temperature = cfg.task_temperature
-        self.max_tokens = cfg.task_max_tokens
+        # 显式传入优先（CLI），否则读 .env/config
+        self.temperature = (cfg.task_temperature if temperature is None
+                            else float(temperature))
+        self.max_tokens = (cfg.task_max_tokens if max_tokens is None
+                           else int(max_tokens))
         self.enable_thinking = cfg.task_enable_thinking
         self.max_context_len = cfg.task_max_context_len
         self.extra_params = cfg.extra_params
@@ -563,6 +569,12 @@ class TaskLM:
         # answer_type 时用它兜底——使 inference() 等省略 answer_type 的路径
         # 也能对 verifiable/redaction 走"判完整回答"而非答案抽取。
         self.dataset_answer_type: str = "exact"
+        # ---- 混合数据集：按样本标签逐题分派判分/格式 ----
+        # engine.set_dataset 传入 "a+b" 时填充；单数据集时为空 dict，
+        # run() 全部回退上面的单数据集字段（行为与旧版完全一致）。
+        self.dataset_judgers: dict[str, callable] = {}
+        self.dataset_formats: dict[str, str] = {}
+        self.dataset_answer_types: dict[str, str] = {}
 
     def _call_llm(self, system: str, user: str) -> str:
         """真实模型调用。无 key 时由 _OpenAIClient 自动回退占位。"""
@@ -581,33 +593,49 @@ class TaskLM:
         context_examples: Optional[list[Example]] = None,
         gold_answer: Optional[str] = None,
         answer_type: Optional[str] = None,
+        sample_dataset: str = "",
     ) -> Trace:
         """在策略 + 检索到的短期规律下执行题目。
 
         context_examples: 命中的短期规律（few-shot 上下文）。
         gold_answer:      标准答案；提供则据 answer_type 判对错。
         answer_type:      exact / numeric / freeform / verifiable / redaction。
-                          None 时回退到 self.dataset_answer_type（set_dataset 注入），
-                          使省略该参数的调用路径也能匹配当前数据集的判分方式。
+                          None 时回退到 sample_dataset 对应类型（混合）或
+                          self.dataset_answer_type（单数据集，set_dataset 注入）。
+        sample_dataset:   样本来源数据集标签（TrainSample.dataset）。混合数据集
+                          时按此标签逐题选择格式指令与判分器；单数据集/空标签
+                          时忽略，行为与旧版一致。
         """
+        fmt = self.dataset_formats.get(sample_dataset, "") if sample_dataset else ""
+        judger = self.dataset_judgers.get(sample_dataset) if sample_dataset else None
+        if judger is None:
+            judger = self.judger
+        if not fmt:
+            fmt = self.dataset_format
         if answer_type is None:
-            answer_type = self.dataset_answer_type
+            answer_type = (self.dataset_answer_types.get(sample_dataset, "")
+                           if sample_dataset else "") or self.dataset_answer_type
         few_shot = "\n".join(e.to_prompt_str() for e in (context_examples or []))
-        system_prompt = self._assemble_system_prompt(few_shot)
+        system_prompt = self._assemble_system_prompt(few_shot, fmt)
         # 记录附加上下文，供反思分析
         ctx = {"strategy_version": self.strategy.version,
                "n_examples": len(context_examples or []),
                "examples_text": few_shot,
                "answer_type": answer_type,
-               "gold_answer": gold_answer or ""}
+               "gold_answer": gold_answer or "",
+               "dataset": sample_dataset}
         raw = self._call_llm(system_prompt, problem)
-        answer, correct = self._parse_output(raw, gold_answer, answer_type)
+        answer, correct = self._parse_output(raw, gold_answer, answer_type,
+                                             judger=judger)
         return Trace(problem=problem, trajectory=raw,
                      result=Result(answer=answer, correct=correct), context=ctx)
 
-    def _assemble_system_prompt(self, few_shot: str) -> str:
+    def _assemble_system_prompt(self, few_shot: str,
+                                fmt: Optional[str] = None) -> str:
         # 顺序：格式指令（数据集期望的输出方式）→ 长期策略 → few-shot 规律
-        base = self.dataset_format or "You are a careful problem solver."
+        # fmt: 按样本数据集选出的格式指令；None 时用单数据集默认。
+        base = (fmt if fmt is not None else self.dataset_format) \
+            or "You are a careful problem solver."
         parts = [base]
         if self.strategy.text:
             parts.append(self.strategy.text)
@@ -777,28 +805,34 @@ class TaskLM:
         return p == g                    # exact 字符串比对
 
     def _parse_output(self, raw: str, gold_answer: Optional[str],
-                      answer_type: str) -> tuple[str, bool]:
+                      answer_type: str,
+                      judger: Optional[callable] = None) -> tuple[str, bool]:
         """抽取答案并据 gold_answer 判对错。无 gold_answer 时默认错。
 
         answer_type ∈ {verifiable, redaction} 时【不做答案抽取】：这类任务对
         模型的完整回答判分（逐约束校验 / PII 泄漏检查），抽取短答案会破坏
         约束验证。此时 answer 即完整 raw，直接交给 judger。
 
-        其余类型：抽取答案后，优先用注入的 judger，否则回退内置 is_correct。
+        judger: 按样本数据集选出的判分器（混合数据集）；None 时用
+        self.judger（单数据集默认）。
+
+        其余类型：抽取答案后，优先用 judger，否则回退内置 is_correct。
         judger 抛 ImportError 时向上冒泡（缺依赖须显式暴露，不能被当成"答错"
         静默吞掉）；其它异常保守判 False。
         """
+        if judger is None:
+            judger = self.judger
         # verifiable / redaction：判完整回答，不抽取
         if answer_type in ("verifiable", "redaction"):
             answer = (raw or "").strip()        # 存储/展示用（strip 后）
             if gold_answer is None:
                 return answer, False
-            if self.judger is not None:
+            if judger is not None:
                 try:
                     # 判分传【未 strip】的完整 raw：官方 IFBench strict 语义下
                     # check_following 收到原始回答（no_whitespace / end_checker
                     # 等约束对首尾空白敏感）；judger 内部自行做空白门槛。
-                    return answer, bool(self.judger(raw or "", gold_answer))
+                    return answer, bool(judger(raw or "", gold_answer))
                 except ImportError:
                     raise                       # 缺依赖/环境：显式暴露，勿判 False
                 except Exception:
@@ -809,9 +843,9 @@ class TaskLM:
         answer = self.extract_answer(raw)
         if gold_answer is None:
             return answer, False
-        if self.judger is not None:
+        if judger is not None:
             try:
-                return answer, bool(self.judger(answer, gold_answer))
+                return answer, bool(judger(answer, gold_answer))
             except ImportError:
                 raise
             except Exception:
@@ -875,12 +909,17 @@ class ReflectionLM:
     def __init__(self, embedder: Optional[Embedder] = None,
                  pattern_gen_mode: Optional[str] = None,
                  reflect_wrong_only: Optional[bool] = None,
-                 cross_aware_gen: Optional[bool] = None) -> None:
+                 cross_aware_gen: Optional[bool] = None,
+                 temperature: Optional[float] = None,
+                 max_tokens: Optional[int] = None) -> None:
         cfg = get_config()
         self.model = cfg.reflection_model
         self.timeout = cfg.reflection_timeout
-        self.temperature = cfg.reflection_temperature
-        self.max_tokens = cfg.reflection_max_tokens
+        # 显式传入优先（CLI），否则读 .env/config
+        self.temperature = (cfg.reflection_temperature if temperature is None
+                            else float(temperature))
+        self.max_tokens = (cfg.reflection_max_tokens if max_tokens is None
+                           else int(max_tokens))
         self.enable_thinking = cfg.reflection_enable_thinking
         self.max_context_len = cfg.reflection_max_context_len
         self.extra_params = cfg.extra_params

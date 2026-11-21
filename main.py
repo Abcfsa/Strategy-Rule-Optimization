@@ -185,7 +185,7 @@ def _save_outputs(
 
 
 def run_dataset(
-    dataset: str, n_train: int, n_val: int, n_test: int, n_iters: int,
+    dataset: str, n_train, n_val, n_test, n_iters: int,
     seed: int, dynamic_learning: bool, output_dir: str | None,
     evo_mode: str, train_retrieve_ctx: bool, test_use_patterns: bool,
     gepa_split: bool = False, pattern_gen_mode: str | None = None,
@@ -194,6 +194,11 @@ def run_dataset(
     cross_aware_gen: bool | None = None,
     initial_prompt: str | None = None,
     test_no_pattern_rerun: bool | None = None,
+    extract_patterns_on_reject: bool | None = None,
+    task_temperature: float | None = None,
+    reflection_temperature: float | None = None,
+    task_max_tokens: int | None = None,
+    reflection_max_tokens: int | None = None,
     skip_initial_baseline: bool = False,
 ) -> None:
     """Load a real dataset and run the two-phase loop, then save outputs.
@@ -211,6 +216,18 @@ def run_dataset(
         print("[WARN] OPENAI_API_KEY not set; using placeholder LM (data-flow demo only).")
 
     print(f"########## Loading dataset: {dataset} ##########")
+    # 单数据集配额必须是非负整数；混合数据集允许 int 或 "a,b" 字符串
+    # （parse_mixed_count 在 load 内校验）
+    if "+" not in dataset:
+        try:
+            n_train, n_val, n_test = int(n_train), int(n_val), int(n_test)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"single dataset '{dataset}' requires integer n_train/n_val/n_test; "
+                f"got {n_train!r}/{n_val!r}/{n_test!r} "
+                f"(comma quotas like '50,30' are only valid for mixed 'a+b' datasets)")
+        if min(n_train, n_val, n_test) < 0:
+            raise ValueError("n_train/n_val/n_test must be non-negative")
     train, val, test = load(dataset, n_train=n_train, n_val=n_val,
                             n_test=n_test, seed=seed, gepa_split=gepa_split)
     print(f"  train: {len(train)} samples | val: {len(val)} samples"
@@ -235,6 +252,11 @@ def run_dataset(
         npo_window=npo_window,
         cross_aware_gen=cross_aware_gen,
         initial_prompt=initial_prompt,
+        extract_patterns_on_reject=extract_patterns_on_reject,
+        task_temperature=task_temperature,
+        reflection_temperature=reflection_temperature,
+        task_max_tokens=task_max_tokens,
+        reflection_max_tokens=reflection_max_tokens,
     )
     engine.set_dataset(dataset, gepa_split=gepa_split)   # inject the matching grader
 
@@ -254,12 +276,22 @@ def run_dataset(
     val_results: list[dict] = []
     correct = 0
     for i, sample in enumerate(eval_set, 1):
-        answer, meta = engine.inference(sample.problem, verbose=False)
-        # grade with the injected judger (consistent with training)
-        ok = engine.task_lm.judger(answer, sample.answer) if engine.task_lm.judger else False
+        answer, meta = engine.inference(sample.problem, verbose=False,
+                                        sample=sample)
+        # grade with the per-sample judger (mixed datasets dispatch by tag;
+        # verifiable/redaction judge the FULL raw response, consistent with
+        # training — grading a short extracted answer would break constraints)
+        judger = engine.task_lm.dataset_judgers.get(sample.dataset) \
+            or engine.task_lm.judger
+        if sample.answer_type in ("verifiable", "redaction"):
+            pred_for_judge = meta.get("raw", "")
+        else:
+            pred_for_judge = answer
+        ok = judger(pred_for_judge, sample.answer) if judger else False
         correct += ok
         tag = "OK" if ok else "X"
-        print(f"  [{i}/{len(val)}] {tag} | branch={meta['branch']}"
+        ds_tag = f" [{sample.dataset}]" if "+" in dataset else ""
+        print(f"  [{i}/{len(eval_set)}]{ds_tag} {tag} | branch={meta['branch']}"
               f" | pred={answer[:40]!r} | gold={sample.answer[:40]!r}")
         val_results.append({
             "index": i,
@@ -267,6 +299,7 @@ def run_dataset(
             "prediction": answer,
             "gold": sample.answer,
             "correct": bool(ok),
+            "dataset": sample.dataset,
             "branch": meta["branch"],
             "dynamic_added": meta.get("dynamic_added", False),
             "matched_examples": meta.get("matched_examples", []),
@@ -294,6 +327,7 @@ def run_dataset(
         "seed": seed, "dynamic_learning": dynamic_learning,
         "test_use_patterns": test_use_patterns,
         "test_no_pattern_rerun": rerun_on,
+        "extract_patterns_on_reject": engine.extract_patterns_on_reject,
         "evo_mode": evo_mode, "train_retrieve_ctx": train_retrieve_ctx,
         "gepa_split": gepa_split,
         "pattern_gen_mode": engine.pattern_gen_mode,
@@ -304,10 +338,15 @@ def run_dataset(
         "cross_aware_gen": engine.cross_aware_gen,
         "initial_prompt": engine.initial_prompt if engine.initial_prompt is not None else "",
         "initial_prompt_explicit": engine.initial_prompt is not None,
+        # 实际生效值（CLI 覆盖后的），非 .env 快照
+        "task_temperature": engine.task_lm.temperature,
+        "reflection_temperature": engine.reflection_lm.temperature,
+        "task_max_tokens": engine.task_lm.max_tokens,
+        "reflection_max_tokens": engine.reflection_lm.max_tokens,
     }
     if output_dir is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = f"sro_output_{dataset}_{ts}"
+        output_dir = f"sro_output_{dataset.replace('+', '_')}_{ts}"
     _save_outputs(Path(output_dir), dataset, cfg, run_params, history,
                   val_results, engine, initial_baseline, no_pattern_rerun)
 
@@ -318,18 +357,25 @@ def main() -> None:
         description="SRO: two-phase reflective self-evolution framework",
     )
     parser.add_argument("--demo", action="store_true", help="run built-in placeholder demo")
-    parser.add_argument("--dataset",
-                        choices=["gsm8k", "math", "math500", "aime", "hotpotqa",
-                                 "ifbench", "livebench", "pupa"],
-                        help="load a real dataset and run the two-phase loop")
-    # these default to .env values; CLI overrides when provided
-    parser.add_argument("--n-train", type=int, default=cfg.n_train,
-                        help=f"number of train samples (default from .env: {cfg.n_train})")
-    parser.add_argument("--n-val", type=int, default=cfg.n_val,
-                        help=f"number of val samples (default from .env: {cfg.n_val})")
-    parser.add_argument("--n-test", type=int, default=cfg.n_test,
-                        help=f"number of test samples for final evaluation "
-                             f"(default from .env: {cfg.n_test}; ignored when --gepa-split)")
+    parser.add_argument("--dataset", type=str, default=None,
+                        help="dataset to run: gsm8k / math / math500 / aime / "
+                             "hotpotqa / ifbench / livebench / pupa, or a mixed "
+                             "pair 'a+b' (exactly 2, e.g. gsm8k+math500; "
+                             "per-sample graders/formats dispatched by tag)")
+    # these default to .env values; CLI overrides when provided.
+    # n-train/n-val/n-test accept int OR "a,b" string for mixed datasets:
+    # single number a = take a from EACH member dataset; "a,b" = a from
+    # dataset 1, b from dataset 2. Validated in run_dataset / load.
+    parser.add_argument("--n-train", type=str, default=str(cfg.n_train),
+                        help=f"train samples: integer, or 'a,b' per-dataset quotas for "
+                             f"mixed 'A+B' (single a = a from EACH dataset) "
+                             f"(default from .env: {cfg.n_train})")
+    parser.add_argument("--n-val", type=str, default=str(cfg.n_val),
+                        help=f"val samples: integer or 'a,b' (same semantics as --n-train) "
+                             f"(default from .env: {cfg.n_val})")
+    parser.add_argument("--n-test", type=str, default=str(cfg.n_test),
+                        help=f"test samples: integer or 'a,b' (same semantics as --n-train); "
+                             f"ignored when --gepa-split (default from .env: {cfg.n_test})")
     parser.add_argument("--n-iters", type=int, default=cfg.n_iters,
                         help=f"number of training iterations (default from .env: {cfg.n_iters})")
     parser.add_argument("--seed", type=int, default=cfg.seed,
@@ -415,6 +461,29 @@ def main() -> None:
     parser.add_argument("--no-test-no-pattern-rerun", dest="test_no_pattern_rerun",
                         action="store_false",
                         help="disable the no-pattern rerun pass")
+    parser.add_argument("--extract-patterns-on-reject", action="store_true",
+                        default=None,
+                        help="GEPA mode: still extract short-term patterns into KB from "
+                             "REJECTED candidates (strict-improvement or STEVE-gate rejects); "
+                             "maximizes experience reuse when training data is scarce, at the "
+                             "risk of low-quality patterns (pair with high "
+                             "PATTERN_DEDUP_THRESHOLD). Strategy is NOT updated on reject "
+                             "(default from .env: EXTRACT_PATTERNS_ON_REJECT)")
+    parser.add_argument("--no-extract-patterns-on-reject",
+                        dest="extract_patterns_on_reject", action="store_false",
+                        help="only extract patterns from accepted candidates (vanilla GEPA)")
+    parser.add_argument("--task-temperature", type=float, default=None,
+                        help=f"TaskLM sampling temperature (default from .env: "
+                             f"{cfg.task_temperature}; 0.0=deterministic)")
+    parser.add_argument("--reflection-temperature", type=float, default=None,
+                        help=f"ReflectionLM sampling temperature (default from .env: "
+                             f"{cfg.reflection_temperature})")
+    parser.add_argument("--task-max-tokens", type=int, default=None,
+                        help=f"TaskLM max output tokens per call (default from .env: "
+                             f"{cfg.task_max_tokens})")
+    parser.add_argument("--reflection-max-tokens", type=int, default=None,
+                        help=f"ReflectionLM max output tokens per call (default from .env: "
+                             f"{cfg.reflection_max_tokens})")
     parser.add_argument("--skip-initial-baseline", action="store_true",
                         help="skip the Phase 0 initial-prompt baseline on val "
                              "(saves |val| extra LLM calls; summary fields become null)")
@@ -434,6 +503,9 @@ def main() -> None:
                     args.regularized_verify, args.npo_window,
                     args.cross_aware_gen, args.initial_prompt,
                     args.test_no_pattern_rerun,
+                    args.extract_patterns_on_reject,
+                    args.task_temperature, args.reflection_temperature,
+                    args.task_max_tokens, args.reflection_max_tokens,
                     args.skip_initial_baseline)
     else:
         parser.print_help()

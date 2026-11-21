@@ -70,15 +70,23 @@ class SROEngine:
         regularized_verify: Optional[bool] = None,  # None=读 .env；STEVE正则化验证门控
         npo_window: Optional[int] = None,           # None=读 .env；NPO滑动窗口W
         extract_patterns_on_reject: Optional[bool] = None,  # None=读 .env；GEPA拒绝时仍提取patterns
+        task_temperature: Optional[float] = None,   # None=读 .env；CLI 覆盖 TaskLM 温度
+        reflection_temperature: Optional[float] = None,  # None=读 .env
+        task_max_tokens: Optional[int] = None,      # None=读 .env；CLI 覆盖 TaskLM 输出上限
+        reflection_max_tokens: Optional[int] = None,  # None=读 .env
     ) -> None:
         from .config import get_config
         cfg = get_config()
         self.embedder = embedder or Embedder()
-        self.task_lm = task_lm or TaskLM(self.embedder)
+        self.task_lm = task_lm or TaskLM(
+            self.embedder, temperature=task_temperature,
+            max_tokens=task_max_tokens)
         self.reflection_lm = reflection_lm or ReflectionLM(
             self.embedder, pattern_gen_mode=pattern_gen_mode,
             reflect_wrong_only=reflect_wrong_only,
-            cross_aware_gen=cross_aware_gen)
+            cross_aware_gen=cross_aware_gen,
+            temperature=reflection_temperature,
+            max_tokens=reflection_max_tokens)
         dedup = (cfg.pattern_dedup_threshold
                  if pattern_dedup_threshold is None else pattern_dedup_threshold)
         self.kb = kb or KnowledgeBase(self.embedder, dedup_threshold=dedup)
@@ -138,20 +146,48 @@ class SROEngine:
         并把该数据集的输出格式指令注入 TaskLM.dataset_format。
 
         dataset: gsm8k / math / math500 / aime / hotpotqa / ifbench / livebench /
-        pupa。判分逻辑复用
+        pupa，或混合 "a+b"（恰好 2 个）。判分逻辑复用
         openai_api_test 中已验证的函数，保证与基线一致。
+
+        混合数据集：为每个成员数据集注册 judger / 格式指令 / 答案类型
+        （TaskLM.dataset_judgers / dataset_formats / dataset_answer_types），
+        TaskLM.run 按样本的 dataset 标签逐题分派；单数据集默认字段取第一个
+        成员（供无标签调用路径兜底，如 demo）。
 
         gepa_split: True 时对格式注入仅 aime 有差别（用 ### 答案格式，对齐
         GEPA init_dataset）；划分侧的 gepa_split 逻辑在 datasets.load 内。
         """
         from .datasets import _import_eval
         from .llm import DATASET_FORMAT_INSTRUCTIONS, DATASET_ANSWER_TYPES
+
+        def _fmt(name: str) -> str:
+            key = "aime_gepa" if (name == "aime" and gepa_split) else name
+            return DATASET_FORMAT_INSTRUCTIONS.get(key, "")
+
+        # 每次绑定先清空混合映射（防止上次运行的残留）
+        self.task_lm.dataset_judgers = {}
+        self.task_lm.dataset_formats = {}
+        self.task_lm.dataset_answer_types = {}
+
+        if "+" in dataset:
+            names = [n.strip() for n in dataset.split("+") if n.strip()]
+            for nm in names:
+                judger, _ = _import_eval(nm)
+                self.task_lm.dataset_judgers[nm] = judger
+                self.task_lm.dataset_formats[nm] = _fmt(nm)
+                self.task_lm.dataset_answer_types[nm] = \
+                    DATASET_ANSWER_TYPES.get(nm, "exact")
+            # 单数据集默认字段 = 第一个成员（无标签路径兜底）
+            first = names[0]
+            self.task_lm.judger = self.task_lm.dataset_judgers[first]
+            self.task_lm.dataset_format = self.task_lm.dataset_formats[first]
+            self.task_lm.dataset_answer_type = \
+                self.task_lm.dataset_answer_types[first]
+            return
+
         judger, _ = _import_eval(dataset)
         self.task_lm.judger = judger
-        if dataset == "aime" and gepa_split:
-            self.task_lm.dataset_format = DATASET_FORMAT_INSTRUCTIONS.get("aime_gepa", "")
-        else:
-            self.task_lm.dataset_format = DATASET_FORMAT_INSTRUCTIONS.get(dataset, "")
+        self.task_lm.dataset_format = _fmt(dataset)
         # 注入数据集答案类型：verifiable/redaction 让 run()/_parse_output 对
         # 完整回答判分（不做答案抽取）。
         self.task_lm.dataset_answer_type = DATASET_ANSWER_TYPES.get(dataset, "exact")
@@ -205,6 +241,7 @@ class SROEngine:
                     context_examples=ctx_examples,
                     gold_answer=sample.answer,
                     answer_type=sample.answer_type,
+                    sample_dataset=sample.dataset,
                 )
                 traces.append(trace)
 
@@ -274,6 +311,7 @@ class SROEngine:
                     s.problem,
                     gold_answer=s.answer,
                     answer_type=s.answer_type,
+                    sample_dataset=s.dataset,
                 )
                 for s in eval_subset
             ]
@@ -311,6 +349,7 @@ class SROEngine:
                 context_examples=ctx_examples,
                 gold_answer=sample.answer,
                 answer_type=sample.answer_type,
+                sample_dataset=sample.dataset,
             )
             # inject gold_answer into context for reflect_gepa diagnostic feedback
             trace.context["gold_answer"] = sample.answer
@@ -330,6 +369,7 @@ class SROEngine:
                 context_examples=[],  # val eval: no KB context, pure strategy
                 gold_answer=sample.answer,
                 answer_type=sample.answer_type,
+                sample_dataset=sample.dataset,
             )
             scores.append(1.0 if trace.result.correct else 0.0)
         self.task_lm.update_strategy(original)
@@ -754,7 +794,8 @@ class SROEngine:
             for i, sample in enumerate(val, 1):
                 trace = self.task_lm.run(
                     sample.problem, gold_answer=sample.answer,
-                    answer_type=sample.answer_type)
+                    answer_type=sample.answer_type,
+                    sample_dataset=sample.dataset)
                 ok = trace.result.correct
                 correct += ok
                 results.append({
@@ -763,6 +804,7 @@ class SROEngine:
                     "prediction": trace.result.answer,
                     "gold": sample.answer,
                     "correct": bool(ok),
+                    "dataset": sample.dataset,
                 })
         finally:
             self.test_use_patterns = saved_patterns
@@ -784,7 +826,8 @@ class SROEngine:
         for i, sample in enumerate(val, 1):
             trace = self.task_lm.run(
                 sample.problem, gold_answer=sample.answer,
-                answer_type=sample.answer_type)
+                answer_type=sample.answer_type,
+                sample_dataset=sample.dataset)
             ok = trace.result.correct
             correct += ok
             results.append({
@@ -835,12 +878,19 @@ class SROEngine:
         k = min(self.top_k, len(candidates))
         return self._random_match_rng.sample(candidates, k)
 
-    def inference(self, question: str, verbose: bool = False) -> tuple[str, dict]:
+    def inference(self, question: str, verbose: bool = False,
+                  sample: Optional[TrainSample] = None) -> tuple[str, dict]:
         """测试推理，含命中/不匹配两条分支。
 
         返回 (answer, meta)，meta 记录走了哪条分支、命中了哪些规律。
         miss 时：若 dynamic_learning 开启则走动态学习，否则直接硬答。
+
+        sample: 可选原始样本（混合数据集必传）——用其 dataset 标签逐题
+        分派格式指令/判分器，并用 answer_type 保证 verifiable/redaction
+        类任务对完整回答判分。None 时行为与旧版一致（单数据集字段兜底）。
         """
+        sd = sample.dataset if sample is not None else ""
+        at = sample.answer_type if sample is not None else None
         # ---- 匹配机制：按 test_match_method 分发 ----
         if self.test_use_patterns:
             if self.test_match_method == "llm":
@@ -859,17 +909,20 @@ class SROEngine:
 
         if hit:
             # ===== 命中分支：例子 + 长期策略 → TaskLM =====
-            trace = self.task_lm.run(question, context_examples=hits)
+            trace = self.task_lm.run(question, context_examples=hits,
+                                     answer_type=at, sample_dataset=sd)
             answer = trace.result.answer
             meta["dynamic_added"] = False
             if verbose:
                 print(f"[MATCH] hit {len(hits)} patterns -> answering directly")
         elif self.dynamic_learning:
             # ===== 不匹配分支：动态学习机制 =====
-            answer, trace = self._dynamic_learning(question, meta, verbose)
+            answer, trace = self._dynamic_learning(question, meta, verbose,
+                                                   sample=sample)
         else:
             # ===== 不匹配且关闭动态学习：直接用长期策略硬答 =====
-            trace = self.task_lm.run(question, context_examples=[])
+            trace = self.task_lm.run(question, context_examples=[],
+                                     answer_type=at, sample_dataset=sd)
             answer = trace.result.answer
             meta["dynamic_added"] = False
             if verbose:
@@ -881,7 +934,8 @@ class SROEngine:
         return answer, meta
 
     def _dynamic_learning(
-        self, question: str, meta: dict, verbose: bool
+        self, question: str, meta: dict, verbose: bool,
+        sample: Optional[TrainSample] = None,
     ) -> tuple[str, Trace]:
         """不匹配时的动态学习：临时归纳规律→临时入库→第二轮测试。
 
@@ -902,7 +956,10 @@ class SROEngine:
                                    threshold=0.0)  # 临时放宽，确保取到刚加的
         else:
             hits = []  # test_use_patterns 关闭：规律照归纳入 KB，但不注入 context
-        trace = self.task_lm.run(question, context_examples=hits)
+        trace = self.task_lm.run(
+            question, context_examples=hits,
+            answer_type=sample.answer_type if sample is not None else None,
+            sample_dataset=sample.dataset if sample is not None else "")
 
         meta["dynamic_added"] = True
         meta["tentative_pattern"] = new_pattern.text[:40]
